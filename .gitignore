@@ -1,0 +1,10 @@
+﻿# local toolchain and build output
+tools/
+bin/
+obj/
+publish/
+*.user
+.vs/
+*.log
+docs/*.png
+docs/*.jpg
