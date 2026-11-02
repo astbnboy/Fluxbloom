@@ -113,7 +113,7 @@ Balanced fits a 240 Hz frame budget (4.2 ms). With Adaptive quality on, Maximum 
 - Windows' Screen Saver Settings drop-down lists only screensavers in `System32`. The per-user install works without admin but may show blank there; `.\install.ps1 -System` (elevated) lists it by name.
 - Shaders are compiled with FXC at start-up (SM 5.1, `d3dcompiler_47.dll`, part of Windows); nothing here needs SM 6.
 - The "On resume, display logon screen" lock option is a Windows setting that this project does not change.
-- No licence has been chosen yet.
+- Released under the MIT licence (see `LICENSE`).
 
 ## Repo layout
 
