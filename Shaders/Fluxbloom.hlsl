@@ -39,7 +39,8 @@ struct Particle
 {
     float2 pos; float2 prev;
     float age; float life; float hseed; uint origin;
-    float2 vel; float rnd; uint pad;
+    float2 vel; float rnd; uint rg;   // rg: baked red/green as two halves (premultiplied emission x1024)
+    float cb; float3 pad;             // cb: baked blue (premultiplied emission x1024)
 };
 
 Texture2D<float4> gTex0 : register(t0);
@@ -293,6 +294,23 @@ void Respawn(inout Particle p, inout uint s, bool first)
     p.hseed = rf(s); p.origin = home; p.rnd = rf(s);
 }
 
+// Colour + emission are evaluated once per particle here (continuous OKLCH, per-form hue/chroma/lightness with spatial hue gradient)
+// instead of once per quad vertex in the vertex shader.
+void BakeColor(inout Particle p)
+{
+    Origin og = gO[min(p.origin, MAX_ORIGINS - 1)];
+    float fade = smoothstep(0.0, 1.0, p.age) * smoothstep(0.0, 1.5, p.life - p.age);
+    float h = og.c.x + (p.hseed - 0.5) * og.c.w + dot(og.e.xy, p.pos) + 0.25 * sin(p.age * 0.6 + p.hseed * TAU);
+    float C = og.c.y * (0.55 + 0.9 * frac(p.hseed * 13.37 + p.rnd * 3.1));
+    float L = og.c.z + 0.10 * (p.rnd - 0.5);
+    bool big = p.rnd > 0.985;
+    float rad = gParticleSize * (big ? 3.2 : 1.0);
+    float gain = gInject * gDt * fade * og.a.w * (big ? 0.9 : 1.0) / max(rad, 0.5);
+    float3 c = LCH(L, C, h) * (gain * 1024.0);
+    p.rg = f32tof16(c.r) | (f32tof16(c.g) << 16);
+    p.cb = c.b;
+}
+
 [numthreads(64, 1, 1)]
 void CS_Update(uint3 id : SV_DispatchThreadID)
 {
@@ -319,6 +337,7 @@ void CS_Update(uint3 id : SV_DispatchThreadID)
         p.prev = p.pos;
         p.pos += p.vel * dt;
     }
+    BakeColor(p);
     gP[i] = p;
 }
 
@@ -366,26 +385,17 @@ VSP VS_Particle(uint vid : SV_VertexID, uint iid : SV_InstanceID)
 {
     VSP o;
     Particle p = gPS[iid];
-    Origin og = gO[min(p.origin, MAX_ORIGINS - 1)];
-    bool alive = (p.life > 0.0) && (p.origin < gOriginCount) && (og.a.w > 0.002);
-    float fade = smoothstep(0.0, 1.0, p.age) * smoothstep(0.0, 1.5, p.life - p.age);
-
-    float h = og.c.x + (p.hseed - 0.5) * og.c.w + dot(og.e.xy, p.pos) + 0.25 * sin(p.age * 0.6 + p.hseed * TAU);
-    float C = og.c.y * (0.55 + 0.9 * frac(p.hseed * 13.37 + p.rnd * 3.1));
-    float L = og.c.z + 0.10 * (p.rnd - 0.5);
-    float3 col = LCH(L, C, h);
-
-    bool big = p.rnd > 0.985;
-    float rad = gParticleSize * (big ? 3.2 : 1.0);
-    float gain = gInject * gDt * fade * og.a.w * (big ? 0.9 : 1.0) / max(rad, 0.5);
-    o.col = float4(col * gain, 1);
+    bool alive = (p.life > 0.0) && (p.age < p.life) && (p.origin < gOriginCount);
+    float rad = gParticleSize * (p.rnd > 0.985 ? 3.2 : 1.0);
+    float3 col = float3(f16tof32(p.rg & 0xFFFF), f16tof32(p.rg >> 16), p.cb) * (1.0 / 1024.0);
+    o.col = float4(col, 1);
     o.rad = rad;
 
     float2 a = CanvasToPx(p.prev), b = CanvasToPx(p.pos);
     float2 d = b - a; float len = length(d);
     float2 dir = len > 1e-4 ? d / len : float2(1, 0);
     float2 nrm = float2(-dir.y, dir.x);
-    float ext = rad * 1.5 + 0.8;
+    float ext = rad * 1.2 + 0.6;
     float s = (vid & 1) ? 1.0 : 0.0;
     float t = (vid & 2) ? 1.0 : -1.0;
     float2 px = lerp(a, b, s) + dir * (s > 0.5 ? ext : -ext) + nrm * t * ext;

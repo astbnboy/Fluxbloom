@@ -30,7 +30,7 @@ unsafe struct FrameCB
 
 public struct RenderStats
 {
-    public double Fps, CpuMs, GpuMs, GpuFieldMs, GpuPostMs, GpuSimMs;
+    public double Fps, CpuMs, GpuMs, GpuFieldMs, GpuPostMs, GpuSimMs, GpuFeedbackMs, GpuParticlesMs;
     public int RenderW, RenderH, OutW, OutH, Particles, Forms;
     public float Scale, ParticleFraction;
     public long VramUsed, VramBudget;
@@ -45,7 +45,8 @@ public sealed unsafe class Renderer : IDisposable
     const int TableStride = 8;
     const Format SceneFmt = Format.R16G16B16A16_Float;
     const Format FinalFmt = Format.R10G10B10A2_UNorm;
-    const int ParticleBytes = 48;
+    const int ParticleBytes = 64;
+    const int Ts = 6; // timestamps per frame
     const int HudW = 512, HudH = 176;
     const uint AllSub = 0xFFFFFFFF;
 
@@ -114,6 +115,7 @@ public sealed unsafe class Renderer : IDisposable
     float scale = 1f, minScale = 0.5f, maxScale = 1f;
     float particleFrac = 1f;
     int capacity, activeBase;
+    int qEff;
     int cur;
     uint frameIndex;
     int syncInterval = 1;
@@ -128,7 +130,7 @@ public sealed unsafe class Renderer : IDisposable
     double lastFrameT;
     double fpsAcc; int fpsCount; double fpsShown;
     double cpuMsAcc;
-    double gpuTotal, gpuSim, gpuField, gpuPost;
+    double gpuTotal, gpuSim, gpuField, gpuPost, gpuFieldOnly, gpuParts;
     double govTimer, lastChangeT;
     int govFrames; double govGpuSum;
     double nextFrameDeadline;
@@ -139,18 +141,58 @@ public sealed unsafe class Renderer : IDisposable
     public Renderer(IntPtr hwnd, int outW, int outH, Settings s, Director d, bool offscreen, float refreshHz, string tag = "main", bool manualPacing = false)
     {
         set = s; dir = d; this.offscreen = offscreen; name = tag; OutW = outW; OutH = outH; RefreshHz = refreshHz; ManualPacing = manualPacing;
-        shaderSource = LoadShaderSource();
-        CreateDevice();
-        CreateQueueAndSync();
-        if (!offscreen) CreateSwapChain(hwnd);
-        CreateHeaps();
-        CreateRootSignatureAndPipelines();
-        CreateStaticResources();
-        if (offscreen) CreateOffscreenTarget();
-        else CreateBackBufferViews();
-        PickInitialScale();
-        CreateSizeDependent();
-        ConfigurePacing();
+        qEff = Math.Clamp(s.Quality, 0, 2);
+        try
+        {
+            shaderSource = LoadShaderSource();
+            CreateDevice();
+            qEff = FitQualityToVram(qEff);
+            CreateQueueAndSync();
+            if (!offscreen) CreateSwapChain(hwnd);
+            CreateHeaps();
+            CreateRootSignatureAndPipelines();
+            CreateStaticResources();
+            if (offscreen) CreateOffscreenTarget();
+            else CreateBackBufferViews();
+            PickInitialScale();
+            CreateSizeDependent();
+            ConfigurePacing();
+        }
+        catch { try { Dispose(); } catch { } throw; }
+    }
+
+    /// <summary>Builds a renderer, stepping down one quality tier if GPU memory or resource creation fails.</summary>
+    public static Renderer CreateWithFallback(IntPtr hwnd, int w, int h, Settings s, Director d, bool offscreen, float hz, string tag, bool manualPacing)
+    {
+        var cfg = s;
+        while (true)
+        {
+            try { return new Renderer(hwnd, w, h, cfg, d, offscreen, hz, tag, manualPacing); }
+            catch (Exception ex) when (cfg.Quality > 0 && (ex is SharpGenException || ex is OutOfMemoryException))
+            {
+                RunLog.Line($"quality {cfg.Quality} failed ({ex.GetType().Name}: {ex.Message}); retrying at quality {cfg.Quality - 1}");
+                cfg = cfg.Clone(); cfg.Quality--;
+            }
+        }
+    }
+
+    long EstimateBytes(int q)
+    {
+        int[] baseP = { 700_000, 1_600_000, 3_200_000 };
+        float[] caps = { 0.6f, 0.85f, 1f };
+        double sc = OutW < 1800 ? 1.0 : caps[q];
+        double px = OutW * sc * OutH * sc;
+        return (long)(baseP[q] * 1.5 * ParticleBytes + px * 8 * 2.4 + (double)OutW * OutH * 4 * 3);
+    }
+
+    int FitQualityToVram(int q)
+    {
+        long budget = 0;
+        try { budget = (long)(adapter3?.QueryVideoMemoryInfo(0, MemorySegmentGroup.Local).Budget ?? 0); } catch { }
+        { var fake = Environment.GetEnvironmentVariable("FLX_VRAM_BUDGET_MB"); if (long.TryParse(fake, out var mb)) budget = mb * 1048576; } // test hook
+        if (budget <= 0) return q;
+        while (q > 0 && EstimateBytes(q) > budget / 2) { RunLog.Line($"VRAM budget {budget / 1048576} MB too small for quality {q} (needs about {EstimateBytes(q) / 1048576} MB); lowering"); q--; }
+        return q;
     }
 
     // ------------------------------------------------------------------ setup
@@ -299,8 +341,8 @@ public sealed unsafe class Renderer : IDisposable
             cbUpload[i] = CommittedBuffer(HeapType.Upload, 8192, ResourceFlags.None, ResourceStates.GenericRead);
             cbPtr[i] = cbUpload[i].Map<byte>(0);
         }
-        queryHeap = device.CreateQueryHeap<ID3D12QueryHeap>(new QueryHeapDescription(QueryHeapType.Timestamp, 4 * FrameCount, 0));
-        queryReadback = CommittedBuffer(HeapType.Readback, 4 * FrameCount * 8, ResourceFlags.None, ResourceStates.CopyDest);
+        queryHeap = device.CreateQueryHeap<ID3D12QueryHeap>(new QueryHeapDescription(QueryHeapType.Timestamp, (uint)(Ts * FrameCount), 0));
+        queryReadback = CommittedBuffer(HeapType.Readback, (ulong)(Ts * FrameCount * 8), ResourceFlags.None, ResourceStates.CopyDest);
         queryPtr = queryReadback.Map<ulong>(0);
 
         // HUD texture (diagnostics), hidden unless enabled
@@ -312,7 +354,7 @@ public sealed unsafe class Renderer : IDisposable
 
         // Particle buffer sized by quality
         int[] baseP = { 700_000, 1_600_000, 3_200_000 };
-        activeBase = baseP[Math.Clamp(set.Quality, 0, 2)];
+        activeBase = baseP[qEff];
         capacity = (int)(activeBase * 1.5f);
         particles = CommittedBuffer(HeapType.Default, (ulong)capacity * ParticleBytes, ResourceFlags.AllowUnorderedAccess, ResourceStates.UnorderedAccess);
         particleState = ResourceStates.UnorderedAccess;
@@ -340,7 +382,7 @@ public sealed unsafe class Renderer : IDisposable
     void PickInitialScale()
     {
         float[] caps = { 0.6f, 0.85f, 1f };
-        maxScale = caps[Math.Clamp(set.Quality, 0, 2)];
+        maxScale = caps[qEff];
         minScale = 0.45f;
         scale = maxScale;
         if (OutW < 1800) { scale = 1f; maxScale = 1f; } // small previews render natively
@@ -432,7 +474,7 @@ public sealed unsafe class Renderer : IDisposable
     {
         float hz = Math.Max(24f, RefreshHz);
         int cap = set.FrameCap == 0 ? (int)MathF.Min(hz, 240f) : set.FrameCap;
-        if (set.Quality == 0 && set.FrameCap == 0) cap = (int)MathF.Min(cap, 60f);
+        if (qEff == 0 && set.FrameCap == 0) cap = (int)MathF.Min(cap, 60f);
         Stats.Cap = cap; Stats.Hz = hz;
         if (set.VSync && !ManualPacing) syncInterval = Math.Max(1, (int)MathF.Round(hz / MathF.Max(cap, 1f)));
         else syncInterval = 0;
@@ -497,7 +539,7 @@ public sealed unsafe class Renderer : IDisposable
 
         allocs[fi].Reset();
         cmd.Reset(allocs[fi], null);
-        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * 4 + 0));
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 0));
         cmd.SetDescriptorHeaps(1, new[] { srvHeap });
 
         // constants
@@ -528,7 +570,7 @@ public sealed unsafe class Renderer : IDisposable
         SetRoot(SrvGpu(T_UPDATE), cbva, true);
         cmd.Dispatch((uint)((cb.ParticleCount + 63) / 64), 1, 1);
         Tr(particles, ref particleState, ResourceStates.NonPixelShaderResource | ResourceStates.PixelShaderResource);
-        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * 4 + 1));
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 1));
 
         // ---- graphics: field (feedback) + particles into scene[cur]
         var dst = scene[cur];
@@ -538,11 +580,12 @@ public sealed unsafe class Renderer : IDisposable
         SetRoot(SrvGpu(T_FIELD + cur), cbva, false);
         PassConst(0, 0, 0, 0);
         DrawFull(dst);
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 2));
         cmd.SetPipelineState(psoParticles);
         cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
         cmd.DrawInstanced(4, cb.ParticleCount, 0, 0);
         Tr(dst, ResourceStates.PixelShaderResource);
-        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * 4 + 2));
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 3));
 
         // ---- bloom: down chain then additive up chain
         for (int i = 0; i < 4; i++)
@@ -599,8 +642,8 @@ public sealed unsafe class Renderer : IDisposable
         }
         else cmd.ResourceBarrierTransition(finalRes, ResourceStates.RenderTarget, ResourceStates.Present, AllSub, ResourceBarrierFlags.None);
 
-        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * 4 + 3));
-        cmd.ResolveQueryData(queryHeap, QueryType.Timestamp, (uint)(fi * 4), 4, queryReadback, (ulong)(fi * 4 * 8));
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 4));
+        cmd.ResolveQueryData(queryHeap, QueryType.Timestamp, (uint)(fi * Ts), 5, queryReadback, (ulong)(fi * Ts * 8));
         cmd.Close();
         queue.ExecuteCommandLists(new ID3D12CommandList[] { cmd });
 
@@ -698,14 +741,16 @@ public sealed unsafe class Renderer : IDisposable
     void ReadTimestamps(int fi)
     {
         if (frameIndex < FrameCount) return;
-        ulong* q = queryPtr + fi * 4;
+        ulong* q = queryPtr + fi * Ts;
         double toMs = 1000.0 / tsFreq;
-        if (q[3] > q[0])
+        if (q[4] > q[0])
         {
-            gpuTotal = (q[3] - q[0]) * toMs;
+            gpuTotal = (q[4] - q[0]) * toMs;
             gpuSim = (q[1] - q[0]) * toMs;
-            gpuField = (q[2] - q[1]) * toMs;
-            gpuPost = (q[3] - q[2]) * toMs;
+            gpuFieldOnly = (q[2] - q[1]) * toMs;
+            gpuParts = (q[3] - q[2]) * toMs;
+            gpuField = gpuFieldOnly + gpuParts;
+            gpuPost = (q[4] - q[3]) * toMs;
         }
     }
 
@@ -720,7 +765,7 @@ public sealed unsafe class Renderer : IDisposable
             Stats.Fps = fpsShown; Stats.CpuMs = cpuMsAcc / fpsCount;
             fpsAcc = 0; fpsCount = 0; cpuMsAcc = 0;
         }
-        Stats.GpuMs = gpuTotal; Stats.GpuSimMs = gpuSim; Stats.GpuFieldMs = gpuField; Stats.GpuPostMs = gpuPost;
+        Stats.GpuFeedbackMs = gpuFieldOnly; Stats.GpuParticlesMs = gpuParts; Stats.GpuMs = gpuTotal; Stats.GpuSimMs = gpuSim; Stats.GpuFieldMs = gpuField; Stats.GpuPostMs = gpuPost;
         Stats.RenderW = rw; Stats.RenderH = rh; Stats.OutW = OutW; Stats.OutH = OutH; Stats.Scale = scale;
         Stats.Particles = activeNow; Stats.ParticleFraction = particleFrac; Stats.Forms = dir.Count; Stats.Gpu = gpuName;
         Stats.Mode = hdrOut ? "HDR10 / Rec.2020, 10-bit" : "SDR sRGB, 10-bit dithered";
@@ -780,7 +825,7 @@ public sealed unsafe class Renderer : IDisposable
             string txt =
                 $"Fluxbloom  [{name}]  {s.Gpu}\n" +
                 $"{s.Fps,6:F1} fps  cap {s.Cap}  ({s.Hz:F0} Hz)  cpu {s.CpuMs:F2} ms\n" +
-                $"gpu {s.GpuMs:F2} ms  sim {s.GpuSimMs:F2}  scene {s.GpuFieldMs:F2}  post {s.GpuPostMs:F2}\n" +
+                $"gpu {s.GpuMs:F2} ms  sim {s.GpuSimMs:F2}  feedback {s.GpuFeedbackMs:F2}  parts {s.GpuParticlesMs:F2}  post {s.GpuPostMs:F2}\n" +
                 $"render {s.RenderW}x{s.RenderH}  out {s.OutW}x{s.OutH}  scale {s.Scale:F2}\n" +
                 $"particles {s.Particles:N0}  ({s.ParticleFraction:P0})  forms {s.Forms}\n" +
                 $"vram {s.VramUsed / 1048576.0:F0} / {s.VramBudget / 1048576.0:F0} MB\n" +

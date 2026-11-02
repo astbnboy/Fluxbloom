@@ -27,6 +27,7 @@ sealed class SaverForm : Form
         KeyPreview = true;
     }
 
+    protected override void OnShown(EventArgs e) { firstMouse = Cursor.Position; base.OnShown(e); }
     protected override void OnPaintBackground(PaintEventArgs e) { }
     protected override void OnPaint(PaintEventArgs e) { e.Graphics.Clear(Color.Black); }
 
@@ -40,7 +41,7 @@ sealed class SaverForm : Form
             firstMouse ??= p;
             if (Math.Abs(p.X - firstMouse.Value.X) > 6 || Math.Abs(p.Y - firstMouse.Value.Y) > 6) ExitRequested = true;
         }
-        else if (exitOnInput) firstMouse = Cursor.Position;
+        else if (exitOnInput) firstMouse = Cursor.Position; // grace period: keep re-basing so launch jitter never exits
         base.OnMouseMove(e);
     }
     protected override void OnDeactivate(EventArgs e) { if (exitOnInput && since.ElapsedMilliseconds > 1500) ExitRequested = true; base.OnDeactivate(e); }
@@ -74,6 +75,8 @@ static class SaverHost
     public static int RunFullscreen(Settings s, bool windowedDebug)
     {
         bool exitOnInput = !windowedDebug;
+        RunLog.Init(windowedDebug ? "window-debug" : "screensaver");
+        foreach (var sc in Screen.AllScreens) RunLog.Line($"screen {sc.DeviceName} primary={sc.Primary} bounds={sc.Bounds.Width}x{sc.Bounds.Height}@({sc.Bounds.X},{sc.Bounds.Y}) refresh={NativeMethods.RefreshOf(sc.DeviceName):F0}Hz");
         var surfaces = new List<Surface>();
         var main = PickMainScreen();
         var screens = Screen.AllScreens;
@@ -101,14 +104,15 @@ static class SaverHost
                     sf.D = new Director(s, aspect, s.Seed == 0 ? 0 : s.Seed + surfaces.Count);
                     float hz = NativeMethods.RefreshOf(scr.DeviceName);
                     var cfg = isMain ? s : OtherDisplaySettings(s);
-                    sf.R = new Renderer(sf.Form.Handle, cs.Width, cs.Height, cfg, sf.D, false, hz, isMain ? "main" : scr.DeviceName.Replace("\\\\.\\", ""), manualPacing: !isMain);
+                    sf.R = Renderer.CreateWithFallback(sf.Form.Handle, cs.Width, cs.Height, cfg, sf.D, false, hz, isMain ? "main" : scr.DeviceName.Replace("\\\\.\\", ""), manualPacing: !isMain);
+                    RunLog.Line($"renderer {(isMain ? "MAIN" : "secondary")} on {scr.DeviceName}: window {sf.Form.Width}x{sf.Form.Height}, client {cs.Width}x{cs.Height} px, refresh {hz:F0} Hz, aspect {aspect:F3}, quality {cfg.Quality}, out size {sf.R.OutW}x{sf.R.OutH}");
                 }
                 surfaces.Add(sf);
             }
             if (exitOnInput) surfaces[0].Form.Activate();
 
             var clock = Stopwatch.StartNew();
-            double last = 0;
+            double last = 0, nextLog = 5;
             while (!exit)
             {
                 Application.DoEvents();
@@ -123,12 +127,18 @@ static class SaverHost
                     if (sf.R.ManualPacing) { if (now < sf.NextDue) continue; sf.NextDue = now + 1.0 / 60.0; sf.R.RenderFrame(1f / 60f); anyDrawn = true; }
                     else { sf.R.RenderFrame(dt); anyDrawn = true; }
                 }
+                if (now >= nextLog)
+                {
+                    nextLog = now + 10;
+                    foreach (var sf in surfaces) if (sf.R != null) { var st = sf.R.Stats; RunLog.Line($"stats {st.Gpu}: {st.Fps:F1} fps (cap {st.Cap}), gpu {st.GpuMs:F2} ms, render {st.RenderW}x{st.RenderH} scale {st.Scale:F2}, particles {st.Particles:N0}, forms {st.Forms}, vram {st.VramUsed / 1048576.0:F0}/{st.VramBudget / 1048576.0:F0} MB, {st.Mode}"); }
+                }
                 if (!anyDrawn) Thread.Sleep(50);
                 else if (surfaces.All(x => x.R == null || x.R.ManualPacing)) Thread.Sleep(2);
             }
         }
         finally
         {
+            RunLog.Line($"exit requested: input={surfaces.Any(x => x.Form.ExitRequested)} displayChangeOrSession={exit}");
             foreach (var sf in surfaces) { try { sf.R?.Dispose(); } catch { } try { sf.Form.Close(); } catch { } }
             if (exitOnInput) Cursor.Show();
         }
@@ -152,7 +162,7 @@ static class SaverHost
         form.Bounds = new Rectangle(0, 0, w, h);
         var ps = s.Clone(); ps.Quality = 0; ps.FrameCap = 30; ps.VSync = false; ps.ShowDiagnostics = false; ps.WideGamutHdr = false; ps.Density = Math.Min(ps.Density, 60);
         var dir = new Director(ps, (float)w / h, ps.Seed);
-        using var r = new Renderer(form.Handle, w, h, ps, dir, false, 60f, "preview", manualPacing: true);
+        using var r = Renderer.CreateWithFallback(form.Handle, w, h, ps, dir, false, 60f, "preview", manualPacing: true);
         var clock = Stopwatch.StartNew(); double next = 0;
         while (NativeMethods.IsWindow(parent) && !form.IsDisposed)
         {
@@ -169,21 +179,21 @@ static class SaverHost
     public static int RunBench(Settings s, int frames, string? pngPath, int w, int h, string logPath)
     {
         var dir = new Director(s, (float)w / h, s.Seed != 0 ? s.Seed : 20261101);
-        using var r = new Renderer(IntPtr.Zero, w, h, s, dir, true, 240f, "bench");
+        using var r = Renderer.CreateWithFallback(IntPtr.Zero, w, h, s, dir, true, 240f, "bench", false);
         var wall = Stopwatch.StartNew();
-        double gpuSum = 0, simSum = 0, fieldSum = 0, postSum = 0; int n = 0;
+        double gpuSum = 0, simSum = 0, fieldSum = 0, partSum = 0, postSum = 0; int n = 0;
         for (int i = 0; i < frames; i++)
         {
             if (i == frames - 1) r.RequestCapture();
             r.RenderFrame(1f / 60f);
-            if (i >= frames - 120) { gpuSum += r.Stats.GpuMs; simSum += r.Stats.GpuSimMs; fieldSum += r.Stats.GpuFieldMs; postSum += r.Stats.GpuPostMs; n++; }
+            if (i >= frames - 120) { gpuSum += r.Stats.GpuMs; simSum += r.Stats.GpuSimMs; fieldSum += r.Stats.GpuFeedbackMs; partSum += r.Stats.GpuParticlesMs; postSum += r.Stats.GpuPostMs; n++; }
         }
         wall.Stop();
         var st = r.Stats;
         string report =
             $"[{DateTime.Now:s}] bench {w}x{h} frames={frames} quality={s.Quality} density={s.Density}\n" +
             $"  GPU: {st.Gpu}\n  render {st.RenderW}x{st.RenderH} (scale {st.Scale:F2}) particles {st.Particles:N0} forms {st.Forms}\n" +
-            $"  GPU ms/frame (last {n}): total {gpuSum / n:F3}  sim {simSum / n:F3}  scene {fieldSum / n:F3}  post {postSum / n:F3}  => {1000.0 / (gpuSum / n):F0} fps GPU-bound\n" +
+            $"  GPU ms/frame (last {n}): total {gpuSum / n:F3}  sim {simSum / n:F3}  feedback {fieldSum / n:F3}  particles {partSum / n:F3}  post {postSum / n:F3}  => {1000.0 / (gpuSum / n):F0} fps GPU-bound\n" +
             $"  wall: {wall.Elapsed.TotalSeconds:F2}s for {frames} frames = {frames / wall.Elapsed.TotalSeconds:F1} fps incl. CPU\n" +
             $"  VRAM: {st.VramUsed / 1048576.0:F0} MB used of {st.VramBudget / 1048576.0:F0} MB budget\n";
         File.AppendAllText(logPath, report);

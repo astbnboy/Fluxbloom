@@ -43,7 +43,7 @@ public sealed class Director
         set = s; this.aspect = aspect;
         rng = seed != 0 ? new Random(seed) : new Random();
         globalHue = (float)(rng.NextDouble() * Math.PI * 2);
-        int n = Math.Max(3, (int)MathF.Round(TargetCount(0f) * 0.85f));
+        int n = Math.Max(7, (int)MathF.Round(TargetCount(0f) * 1.25f));
         for (int i = 0; i < n; i++) Spawn(initial: true);
     }
 

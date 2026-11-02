@@ -8,3 +8,5 @@ publish/
 *.log
 docs/*.png
 docs/*.jpg
+out/
+dist/
