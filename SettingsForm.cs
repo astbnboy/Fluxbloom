@@ -30,7 +30,7 @@ sealed class SettingsForm : Form
 
         Header("Look");
         Combo("Style", Styles, () => s.Style, v => s.Style = v);
-        Slider("Geometry amount", 0, 100, () => s.Geometry, v => s.Geometry = v, "%");
+        Slider("Geometry forms on screen (max)", 0, 3, () => s.MaxGeometry, v => s.MaxGeometry = v, "");
         Slider("Density", 20, 200, () => s.Density, v => s.Density = v, "%");
         Slider("Motion speed", 10, 250, () => s.Speed, v => s.Speed = v, "%");
         Slider("Brightness", 20, 120, () => s.Brightness, v => s.Brightness = v, "");
@@ -98,7 +98,7 @@ sealed class SettingsForm : Form
 
     void Slider(string label, int min, int max, Func<int> get, Action<int> set, string unit)
     {
-        var tb = new TrackBar { Minimum = min, Maximum = max, TickFrequency = (max - min) / 10, Dock = DockStyle.Fill, Value = Math.Clamp(get(), min, max), AutoSize = false, Height = 30 };
+        var tb = new TrackBar { Minimum = min, Maximum = max, TickFrequency = Math.Max(1, (max - min) / 10), Dock = DockStyle.Fill, Value = Math.Clamp(get(), min, max), AutoSize = false, Height = 30 };
         var val = new Label { Text = tb.Value + unit, Anchor = AnchorStyles.Left, AutoSize = true, Margin = new Padding(0, 6, 0, 0) };
         tb.ValueChanged += (_, _) => { set(tb.Value); val.Text = tb.Value + unit; };
         appliers[label] = ns => { tb.Value = Math.Clamp(PropOf(ns, label, get), min, max); };

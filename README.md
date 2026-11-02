@@ -2,7 +2,7 @@
 
 A GPU-accelerated generative screensaver for super-ultrawide displays, written for a **Samsung Odyssey G9 (32:9, 5120 x 1440, up to 240 Hz)** driven by an **NVIDIA RTX 3060 Ti** on Windows 11. Direct3D 12, HLSL compute and pixel shaders, C# / .NET 8.
 
-Ten kinds of mathematical form grow from anywhere on the canvas (edges and corners included), over a flowing fractal-flame background. They overlap, merge, split, fade in and out over many seconds, and keep transforming continuously. Everything is computed on the GPU every frame; there is no pre-rendered content. Original work; it does not copy Electric Sheep's code, artwork or branding.
+Ten kinds of mathematical form appear on a sparse, flowing fractal-flame background. **Only one to three of them are on screen at any time**, chosen at random and cross-fading in and out over many seconds, each growing from anywhere on the canvas (edges and corners included) and transforming continuously. This keeps the screen calm and the GPU load low. Everything is computed on the GPU every frame; there is no pre-rendered content. Original work; it does not copy Electric Sheep's code, artwork or branding.
 
 ## The geometry library
 
@@ -20,7 +20,7 @@ Ten kinds of mathematical form grow from anywhere on the canvas (edges and corne
 | **Klein bottle** | Non-orientable surface (Lawson embedding in R4), rotated through 4D and projected, so it passes through itself | Parametric surface wireframe, 4D rotation + 4D to 3D perspective |
 | **Flow forms** | Flame-like filaments, tendrils, vortices, cellular membranes, with N-fold symmetry | Feedback field + particles (the original engine) |
 
-All parameters are animated by slow sine mixtures, so every transformation is continuous; nothing pops. Forms carry their own colour (see below), size, anisotropy and orientation, so a Lissajous figure can sweep the full 5120 px width while a Mandelbulb sits in a corner.
+The scheduler never shows more than three geometry forms and never leaves the screen without one: it re-rolls how many to show (1 to the maximum) every 30-80 s, picks types that are not already on screen, retires forms one at a time, and staggers their lifetimes so replacements always overlap. `Fluxbloom.exe /dirtest <hours>` simulates the scheduler headlessly and verifies this (40 simulated hours, 5 seeds: always 1 to 3, average 2.3). All parameters are animated by slow sine mixtures, so every transformation is continuous; nothing pops. Forms carry their own colour (see below), size, anisotropy and orientation, so a Lissajous figure can sweep the full 5120 px width while a Mandelbulb sits in a corner.
 
 ## Quick start
 
@@ -43,6 +43,7 @@ Needs on the PC that runs it: Windows 10/11 x64, a Direct3D 12 GPU, and the **.N
 | `/p <hwnd>` | Live preview in the Windows Screen Saver Settings thumbnail (low quality, 30 fps). |
 | `/w` | Debug window on the main display with the diagnostics overlay (Esc quits). |
 | `/bench <frames> <out.png> [quality 0-2] [density]` | Offscreen render at 5120 x 1440 with no window; GPU timings go to `%APPDATA%\Fluxbloom\bench.txt`. |
+| `/dirtest [hours]` | Headless scheduler check (see above); results in `%APPDATA%\Fluxbloom\dirtest.txt`. |
 
 Test environment variables: `FLX_TYPES=10,11` forces only those form types (codes in the table above: 1 Lissajous, 2 spirograph, 3 Lorenz, 4 superformula 2D, 5 superformula 3D, 6 Klein, 10 Mandelbulb, 11 quaternion Julia, 12 gyroid, 13 Julia set, 14 Voronoi); `FLX_FAKE_AUDIO=1` drives the audio hooks with a synthetic 120 BPM signal; `FLX_VRAM_BUDGET_MB=600` simulates a small VRAM budget.
 
@@ -53,8 +54,8 @@ Stored in `%APPDATA%\Fluxbloom\settings.json`; edit with `/c`.
 | Setting | Meaning |
 |---|---|
 | Style | Mixed (flow + geometry), Flame, Tendrils, Cellular, Spirals, **Mathematical geometry only**, **Fractals only (Mandelbulb, quaternion Julia, Julia)**. |
-| Geometry amount | Share of forms that are mathematical geometry in the Mixed style (default 75 %). |
-| Density | Number of simultaneous forms (20-200 %). |
+| Geometry forms on screen (max) | 0-3 (default 3). The scene shows between 1 and this many at a time; 0 turns geometry off. With a maximum below 3, one extra form can be present for a few seconds while one cross-fades into the next. |
+| Density | Number of flow-background forms (20-200 %). |
 | Motion speed | Scales flow velocity and drift. |
 | Brightness, Colour richness, Colour drift | Exposure; chroma scale; speed of the palette's hue rotation. |
 | Quality / power | **Low power**: render scale up to 0.6, fewer particles, 60 fps cap. **Balanced**: scale up to 0.85. **Maximum**: native resolution, most detail. |
@@ -94,15 +95,15 @@ The animation is built so a looping music track can drive it without the visuals
 
 ## Measured performance
 
-Offscreen at 5120 x 1440, RTX 3060 Ti, default Mixed style, three different compositions (sparse to crowded), 500 frames each, GPU timestamps:
+Offscreen at 5120 x 1440, RTX 3060 Ti, default Mixed style, four different compositions (1 to 3 geometry forms each), 700 frames, GPU timestamps:
 
-| Quality | Render size | GPU ms (sparse / mid / crowded) | Average | GPU-bound fps | VRAM |
+| Quality | Render size | GPU ms (four scenes) | Average | GPU-bound fps | VRAM |
 |---|---|---|---|---|---|
-| Maximum | 5120 x 1440 (1.00) | 4.5 / 5.7 / 11.4 | 7.2 ms | about 139 | 586 MB |
-| Balanced | 4352 x 1224 (0.85) | 2.5 / 3.1 / 6.1 | 3.9 ms | about 254 | 357 MB |
-| Low power | 3072 x 864 (0.60) | 1.2 / 1.4 / 2.6 | 1.7 ms | about 587 | 188 MB |
+| Maximum | 5120 x 1440 (1.00) | 5.0 / 7.6 / 8.7 / 9.8 | 7.7 ms | about 129 | 586 MB |
+| Balanced | 4352 x 1224 (0.85) | 2.6 / 3.7 / 4.5 / 4.9 | 3.9 ms | about 254 | 357 MB |
+| Low power | 3072 x 864 (0.60) | 1.1 / 1.5 / 1.9 / 2.1 | 1.7 ms | about 597 | 188 MB |
 
-The geometry pass averages 1.6 / 0.7 / 0.2 ms. With Adaptive quality on, Maximum degrades gracefully in the crowded case to hold a 240 Hz cap.
+Balanced fits a 240 Hz frame budget (4.2 ms). With Adaptive quality on, Maximum degrades gracefully when a scene is heavy.
 
 ## Limitations
 

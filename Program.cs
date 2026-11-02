@@ -30,6 +30,8 @@ static class Program
                 case "/w": // windowed debug run (Esc quits, mouse/keys don't)
                     settings.ShowDiagnostics = true;
                     return SaverHost.RunFullscreen(settings, windowedDebug: true);
+                case "/dirtest": // headless: simulate the director for hours and check the 1-3 geometry rule
+                    return DirectorTest.Run(settings, args.Length > 1 && int.TryParse(args[1], out var hrs) ? hrs : 4);
                 case "/p": // preview in the Windows settings dialog
                     return long.TryParse(arg, out long h) ? SaverHost.RunPreview(settings, new IntPtr(h)) : 1;
                 case "/bench": // /bench <frames> <out.png> [quality 0-2] [density]

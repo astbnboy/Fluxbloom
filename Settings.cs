@@ -6,7 +6,7 @@ namespace Fluxbloom;
 public sealed class Settings
 {
     public int Style { get; set; } = 0;            // 0 Mixed, 1 Flame, 2 Tendrils, 3 Cellular, 4 Spiral, 5 Math geometry, 6 Fractals
-    public int Geometry { get; set; } = 75;        // 0..100: share of forms that are mathematical geometry (Mixed style)
+    public int MaxGeometry { get; set; } = 3;      // 0..3: at most this many geometry forms on screen at once (1 to this many, chosen at random)
     public int Speed { get; set; } = 100;          // 10..250 (% of base motion speed)
     public int Density { get; set; } = 100;        // 20..200 (% of base number of forms / particles)
     public int Brightness { get; set; } = 80;      // 20..120
@@ -51,7 +51,7 @@ public sealed class Settings
     public void Clamp()
     {
         Style = Math.Clamp(Style, 0, 6);
-        Geometry = Math.Clamp(Geometry, 0, 100);
+        MaxGeometry = Math.Clamp(MaxGeometry, 0, 3);
         Speed = Math.Clamp(Speed, 10, 250);
         Density = Math.Clamp(Density, 20, 200);
         Brightness = Math.Clamp(Brightness, 20, 120);

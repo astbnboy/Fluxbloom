@@ -49,17 +49,22 @@ public sealed class Director
     readonly float aspect;
     readonly List<Org> orgs = new();
     readonly float[] cover = new float[GX * GY];
-    float time, nextSpawn = 0.5f, nextEvent = 28f;
+    float time, nextSpawn = 0.5f, nextEvent = 28f, nextGeoSpawn = 1f, nextGeoRoll;
+    int geoTarget;
+    FormType lastGeo = FormType.Flow;
     float globalHue;
     public readonly float[] Gpu = new float[Max * FloatsPerOrigin];
     public int Count { get; private set; }
     public int GeometryCount { get; private set; }
+    /// <summary>Geometry forms currently visible (weight > 0.02). Never more than 3.</summary>
+    public int VisibleGeometry { get; private set; }
     /// <summary>Sum of flow-particle weights (weight x density) and of curve-particle weights over live forms; the renderer sizes its particle pools from these.</summary>
     public float FlowWeightSum { get; private set; }
     public float CurveWeightSum { get; private set; }
     public float GlobalFade { get; private set; }
     public float Time => time;
     public int ActiveForms => orgs.Count;
+    public string DebugState() => $"t={time:F1} geoTarget={geoTarget} nextGeoSpawn={nextGeoSpawn:F1} | " + string.Join("; ", orgs.Where(o => o.Type != FormType.Flow).Select(o => $"{o.Type} w={o.Weight:F3} age={time - o.Birth:F1}/{o.Life:F1} fadeIn={o.FadeIn:F1} fadeOut={o.FadeOut:F1}"));
 
     // audio features (0 when no music is playing); consumed by the animation, never used to drive time
     public float Bass, Mid, Treble, Beat;
@@ -69,17 +74,41 @@ public sealed class Director
         set = s; this.aspect = aspect;
         rng = seed != 0 ? new Random(seed) : new Random();
         globalHue = (float)(rng.NextDouble() * Math.PI * 2);
-        int n = Math.Max(8, (int)MathF.Round(TargetCount(0f) * 1.3f));
-        // guarantee a visible mix of geometry on the very first frames
-        FormType[] starters = { FormType.Mandelbulb, FormType.Lorenz, FormType.Lissajous, FormType.Julia2D, FormType.Superformula3D, FormType.QuaternionJulia, FormType.Spirograph, FormType.Voronoi, FormType.Gyroid, FormType.KleinBottle, FormType.Superformula2D };
-        int geo = s.Style == 5 || s.Style == 6 ? n : (int)MathF.Round(n * Math.Clamp(s.Geometry / 100f, 0f, 1f) * (s.Style == 0 ? 0.9f : 0.4f));
-        for (int i = 0; i < n; i++)
-        {
-            FormType? force = null;
-            if (DebugTypes is { Length: > 0 }) force = (FormType)DebugTypes[i % DebugTypes.Length];
-            else if (i < geo) force = s.Style == 6 ? PickFractalType() : starters[(i + rng.Next(3)) % starters.Length];
-            Spawn(initial: true, force: force);
-        }
+        geoTarget = RollGeoTarget();
+        nextGeoRoll = R(30f, 80f);
+        // flow forms are the calm background; geometry is limited to 1-3 random forms at a time
+        int nFlow = FlowTarget(0f) <= 0f ? 0 : Math.Max(3, (int)MathF.Round(TargetCount(0f)));
+        for (int i = 0; i < nFlow; i++) Spawn(initial: true, force: FormType.Flow);
+        for (int i = 0; i < geoTarget; i++) Spawn(initial: true, force: NextGeoType());
+    }
+
+    bool GeometryOnlyStyle => set.Style == 5 || set.Style == 6;
+    /// <summary>Most geometry forms visible at once, counting a cross-fading pair: the setting (max 3), plus one only while swapping when below 3.</summary>
+    int GeoVisibleCap { get { int m = Math.Clamp(set.MaxGeometry, 0, 3); return m >= 3 ? 3 : m + 1; } }
+    float FlowTarget(float t) => GeometryOnlyStyle ? 0f : TargetCount(t);
+
+    /// <summary>How many geometry forms to show for the next while: random 1..MaxGeometry (never more than 3, 0 if disabled).</summary>
+    int RollGeoTarget()
+    {
+        int max = Math.Clamp(set.MaxGeometry, 0, 3);
+        if (max == 0) return 0;
+        return 1 + rng.Next(max);
+    }
+
+    /// <summary>Random geometry type that is not already on screen and not the one just shown.</summary>
+    FormType NextGeoType()
+    {
+        if (DebugTypes is { Length: > 0 }) return (FormType)DebugTypes[rng.Next(DebugTypes.Length)];
+        FormType[] all = { FormType.Mandelbulb, FormType.QuaternionJulia, FormType.Gyroid, FormType.Julia2D, FormType.Voronoi,
+                           FormType.Lissajous, FormType.Spirograph, FormType.Lorenz, FormType.Superformula2D, FormType.Superformula3D, FormType.KleinBottle };
+        FormType[] fractals = { FormType.Mandelbulb, FormType.QuaternionJulia, FormType.Julia2D };
+        var pool = set.Style == 6 ? fractals : all;
+        int rays = orgs.Count(o => IsRay(o.Type));
+        var cand = pool.Where(tp => tp != lastGeo && !orgs.Any(o => o.Type == tp) && !(IsRay(tp) && rays >= 2)).ToArray();
+        if (cand.Length == 0) cand = pool.Where(tp => tp != lastGeo).ToArray();
+        var pick = cand[rng.Next(cand.Length)];
+        lastGeo = pick;
+        return pick;
     }
 
     float F() => (float)rng.NextDouble();
@@ -90,7 +119,7 @@ public sealed class Director
         float m = 0.5f + 0.5f * MathF.Sin(t * 0.0261f + 0.7f) * MathF.Sin(t * 0.0113f + 2.1f + globalHue);
         m = ColorMath.Smooth(0.0f, 1.0f, m);
         float dens = set.Density / 100f;
-        return Math.Clamp((3f + 14f * m) * dens, 2f, 22f);
+        return Math.Clamp((2f + 6f * m) * dens, 1f, 12f);   // flow forms are only the backdrop now: about 2-8 at 100 % density
     }
 
     float PickKind()
@@ -108,33 +137,6 @@ public sealed class Director
 
     static bool IsRay(FormType t) => t == FormType.Mandelbulb || t == FormType.QuaternionJulia || t == FormType.Gyroid;
     static bool IsGeometry(FormType t) => t != FormType.Flow;
-
-    FormType PickFractalType()
-    {
-        FormType[] a = { FormType.Mandelbulb, FormType.QuaternionJulia, FormType.Julia2D, FormType.Mandelbulb, FormType.QuaternionJulia };
-        return a[rng.Next(a.Length)];
-    }
-
-    FormType PickType()
-    {
-        if (DebugTypes is { Length: > 0 }) return (FormType)DebugTypes[rng.Next(DebugTypes.Length)];
-        float geom = set.Style == 5 || set.Style == 6 ? 1f : set.Geometry / 100f * (set.Style == 0 ? 0.9f : 0.3f);
-        if (F() > geom) return FormType.Flow;
-        if (set.Style == 6) return PickFractalType();
-        (FormType t, float w)[] table =
-        {
-            (FormType.Mandelbulb, 12), (FormType.QuaternionJulia, 10), (FormType.Gyroid, 8), (FormType.Julia2D, 9), (FormType.Voronoi, 8),
-            (FormType.Lissajous, 8), (FormType.Spirograph, 8), (FormType.Lorenz, 8), (FormType.Superformula2D, 6), (FormType.Superformula3D, 6), (FormType.KleinBottle, 6),
-        };
-        int rays = orgs.Count(o => IsRay(o.Type));
-        for (int attempt = 0; attempt < 6; attempt++)
-        {
-            float tot = 0; foreach (var e in table) tot += e.w;
-            float r = F() * tot;
-            foreach (var e in table) { r -= e.w; if (r <= 0) { if (IsRay(e.t) && rays >= 3) break; return e.t; } }
-        }
-        return FormType.Lissajous;
-    }
 
     (float x, float y) PickPosition(bool initial)
     {
@@ -158,7 +160,7 @@ public sealed class Director
     {
         if (orgs.Count >= Max) return;
         var o = new Org();
-        o.Type = force ?? (parent != null ? parent.Type : PickType());
+        o.Type = force ?? FormType.Flow;   // geometry forms are only ever created by the 1-3 slot scheduler (NextGeoType)
         var (px, py) = PickPosition(initial);
         o.X = px; o.Y = py;
         if (parent != null) { float a = R(0, 6.2832f); o.X = parent.X + MathF.Cos(a) * parent.Radius * 0.9f; o.Y = parent.Y + MathF.Sin(a) * parent.Radius * 0.9f; }
@@ -235,7 +237,15 @@ public sealed class Director
                 o.Radius = R(0.45f, 0.85f); o.Stretch = 1f; o.CurveFrac = 0; o.Density = R(0.25f, 0.5f);
                 break;
         }
-        o.Life = R(80f, 200f);
+        o.Life = R(60f, 130f);
+        for (int tries = 0; tries < 6; tries++)   // stagger: never end within 35 s of another geometry form, so replacements overlap smoothly
+        {
+            bool clash = false;
+            foreach (var q in orgs) if (q.Type != FormType.Flow && MathF.Abs((q.Birth + q.Life) - (time + o.Life)) < 35f) { clash = true; break; }
+            if (!clash) break;
+            o.Life += 20f;
+        }
+        o.Radius = MathF.Min(o.Radius * 1.45f, 1.05f);   // few forms on screen, so let each one be a feature
         if (IsRay(o.Type) || o.Type == FormType.Julia2D || o.Type == FormType.Voronoi) { o.Sym = 1; }
     }
 
@@ -359,30 +369,67 @@ public sealed class Director
             }
         }
 
-        float target = TargetCount(time);
-        int live = 0; foreach (var o in orgs) if (time - o.Birth < o.Life - o.FadeOut) live++;
-        if (time >= nextSpawn && live < target) { Spawn(); nextSpawn = time + R(1.5f, 4.5f); }
+        // ---- flow forms: the calm background engine (4 of the 24 slots stay reserved for geometry)
+        float target = FlowTarget(time);
+        int live = 0, liveGeo = 0;
+        foreach (var o in orgs)
+        {
+            bool alive = time - o.Birth < o.Life - o.FadeOut;
+            if (!alive) continue;
+            if (o.Type == FormType.Flow) live++; else liveGeo++;
+        }
+        if (time >= nextSpawn && live < target && orgs.Count < Max - 4) { Spawn(force: FormType.Flow); nextSpawn = time + R(1.5f, 4.5f); }
         else if (live > target + 1.5f)
         {
             Org? worst = null;
-            foreach (var o in orgs) if (time - o.Birth < o.Life - o.FadeOut - 1f && time - o.Birth > o.FadeIn + 5f && (worst == null || o.Life - (time - o.Birth) > worst.Life - (time - worst.Birth))) worst = o;
+            foreach (var o in orgs) if (o.Type == FormType.Flow && time - o.Birth < o.Life - o.FadeOut - 1f && time - o.Birth > o.FadeIn + 5f && (worst == null || o.Life - (time - o.Birth) > worst.Life - (time - worst.Birth))) worst = o;
             if (worst != null) worst.Life = (time - worst.Birth) + worst.FadeOut + 0.5f;
         }
 
-        if (time >= nextEvent && orgs.Count >= 3)
+        // ---- geometry: only 1 to 3 random forms on screen at any time, cross-fading
+        if (time >= nextGeoRoll) { geoTarget = RollGeoTarget(); nextGeoRoll = time + R(30f, 80f); }
+        int visGeo = 0, rising = 0;   // forms that are visible (weight > 0.02), and forms just spawned that will become visible
+        foreach (var o in orgs) { if (o.Type == FormType.Flow) continue; if (o.Weight > 0.02f) visGeo++; else if (time - o.Birth < o.FadeIn) rising++; }
+        if (liveGeo > geoTarget)
         {
-            nextEvent = time + R(22f, 55f);
-            if (F() < 0.5f)
+            // too many: retire the one that has been up longest (it fades out over 10-22 s) - but one at a time, and never while another
+            // geometry form is fading or about to, so the screen is never left without geometry
+            bool anyFading = false; float nextFade = float.MaxValue; Org? oldest = null;
+            foreach (var o in orgs)
             {
-                var a = orgs[rng.Next(orgs.Count)];
-                Org? b = null; float bd = float.MaxValue;
-                foreach (var o in orgs) if (o != a && o.MergeInto == null) { float d = (o.X - a.X) * (o.X - a.X) + (o.Y - a.Y) * (o.Y - a.Y); if (d < bd) { bd = d; b = o; } }
-                if (b != null && a.MergeInto == null && time - a.Birth > a.FadeIn) { a.MergeInto = b; a.Life = (time - a.Birth) + 14f + a.FadeOut; }
+                if (o.Type == FormType.Flow) continue;
+                float fadeStartIn = (o.Birth + o.Life - o.FadeOut) - time;
+                if (fadeStartIn <= 0f) { anyFading = true; continue; }
+                nextFade = MathF.Min(nextFade, fadeStartIn);
+                if (oldest == null || o.Birth < oldest.Birth) oldest = o;
             }
-            else
+            if (!anyFading && nextFade > 25f && oldest != null) oldest.Life = (time - oldest.Birth) + oldest.FadeOut + 0.5f;
+        }
+        else if (liveGeo < geoTarget && visGeo + rising < GeoVisibleCap && (liveGeo == 0 || time >= nextGeoSpawn))   // never leave the screen without geometry
+        {
+            Spawn(force: NextGeoType());
+            nextGeoSpawn = time + R(2f, 5f);
+        }
+
+        // ---- events on flow forms only: merge two, or split one into a child
+        if (time >= nextEvent)
+        {
+            var flows = orgs.Where(o => o.Type == FormType.Flow).ToList();
+            if (flows.Count >= 3)
             {
-                var p = orgs[rng.Next(orgs.Count)];
-                if (time - p.Birth > p.FadeIn) Spawn(parent: p);
+                nextEvent = time + R(22f, 55f);
+                if (F() < 0.5f)
+                {
+                    var a = flows[rng.Next(flows.Count)];
+                    Org? b = null; float bd = float.MaxValue;
+                    foreach (var o in flows) if (o != a && o.MergeInto == null) { float d = (o.X - a.X) * (o.X - a.X) + (o.Y - a.Y) * (o.Y - a.Y); if (d < bd) { bd = d; b = o; } }
+                    if (b != null && a.MergeInto == null && time - a.Birth > a.FadeIn) { a.MergeInto = b; a.Life = (time - a.Birth) + 14f + a.FadeOut; }
+                }
+                else
+                {
+                    var p = flows[rng.Next(flows.Count)];
+                    if (time - p.Birth > p.FadeIn && orgs.Count < Max - 4) Spawn(parent: p, force: FormType.Flow);
+                }
             }
         }
 
@@ -412,6 +459,7 @@ public sealed class Director
             if (o.Type >= FormType.Lissajous && o.Type <= FormType.KleinBottle) cw += o.Weight * o.CurveFrac;
             n++;
         }
+        VisibleGeometry = 0; foreach (var o in orgs) if (o.Type != FormType.Flow && o.Weight > 0.02f) VisibleGeometry++;
         Count = top; GeometryCount = geo; FlowWeightSum = fw; CurveWeightSum = cw;   // Count = highest used slot + 1 (shader loop bound)
     }
 }
