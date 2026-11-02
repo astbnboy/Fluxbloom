@@ -1,16 +1,28 @@
 namespace Fluxbloom;
 
+/// <summary>Kinds of form. Values match the HLSL type codes (Origin.d.w).</summary>
+public enum FormType
+{
+    Flow = 0,
+    Lissajous = 1, Spirograph = 2, Lorenz = 3, Superformula2D = 4, Superformula3D = 5, KleinBottle = 6,
+    Mandelbulb = 10, QuaternionJulia = 11, Gyroid = 12, Julia2D = 13, Voronoi = 14,
+}
+
 /// <summary>
-/// CPU-side composition director. It owns a pool of up to 24 "origins" (independent generative forms). Each origin has its own
-/// position anywhere on the 32:9 canvas, scale, anisotropy, symmetry, flow style and colour (continuous OKLCH), a lifecycle with
-/// long smooth fades, and slow parameter wander. A coverage grid steers new origins toward the least-covered part of the canvas
-/// so there are no persistent dead zones. It emits a flat float array that mirrors the HLSL Origin struct (24 floats each).
+/// CPU-side composition director. It owns a pool of up to 24 "origins" (independent forms). Each is either a flow form or a
+/// mathematical geometry form (see <see cref="FormType"/>), with its own position anywhere on the 32:9 canvas, scale, colour
+/// (continuous OKLCH), lifecycle with long smooth fades, and continuously animated mathematical parameters. A coverage grid
+/// steers new forms toward the least-covered part of the canvas so there are no persistent dead zones. It emits a flat float
+/// array that mirrors the HLSL Origin struct (32 floats each).
 /// </summary>
 public sealed class Director
 {
     public const int Max = 24;
-    public const int FloatsPerOrigin = 24;
+    public const int FloatsPerOrigin = 32;
     const int GX = 64, GY = 16;
+
+    /// <summary>Debug/test: restrict spawned forms to these type codes (set from FLX_TYPES in Program).</summary>
+    public static int[]? DebugTypes;
 
     sealed class Org
     {
@@ -23,6 +35,13 @@ public sealed class Director
         public float Ph1, Ph2, Ph3;
         public Org? MergeInto;
         public float Weight, KindNow, RadiusNow, TwistNow;
+        // geometry
+        public int Slot;                   // fixed GPU slot for the form's whole life, so particle -> form indices stay valid
+        public FormType Type;
+        public float CurveFrac;
+        public float[] B = new float[8];   // per-type base values
+        public float[] W = new float[8];   // per-type phases
+        public readonly float[] G = new float[4], H = new float[4];
     }
 
     readonly Random rng;
@@ -34,17 +53,33 @@ public sealed class Director
     float globalHue;
     public readonly float[] Gpu = new float[Max * FloatsPerOrigin];
     public int Count { get; private set; }
+    public int GeometryCount { get; private set; }
+    /// <summary>Sum of flow-particle weights (weight x density) and of curve-particle weights over live forms; the renderer sizes its particle pools from these.</summary>
+    public float FlowWeightSum { get; private set; }
+    public float CurveWeightSum { get; private set; }
     public float GlobalFade { get; private set; }
     public float Time => time;
     public int ActiveForms => orgs.Count;
+
+    // audio features (0 when no music is playing); consumed by the animation, never used to drive time
+    public float Bass, Mid, Treble, Beat;
 
     public Director(Settings s, float aspect, int seed)
     {
         set = s; this.aspect = aspect;
         rng = seed != 0 ? new Random(seed) : new Random();
         globalHue = (float)(rng.NextDouble() * Math.PI * 2);
-        int n = Math.Max(7, (int)MathF.Round(TargetCount(0f) * 1.25f));
-        for (int i = 0; i < n; i++) Spawn(initial: true);
+        int n = Math.Max(8, (int)MathF.Round(TargetCount(0f) * 1.3f));
+        // guarantee a visible mix of geometry on the very first frames
+        FormType[] starters = { FormType.Mandelbulb, FormType.Lorenz, FormType.Lissajous, FormType.Julia2D, FormType.Superformula3D, FormType.QuaternionJulia, FormType.Spirograph, FormType.Voronoi, FormType.Gyroid, FormType.KleinBottle, FormType.Superformula2D };
+        int geo = s.Style == 5 || s.Style == 6 ? n : (int)MathF.Round(n * Math.Clamp(s.Geometry / 100f, 0f, 1f) * (s.Style == 0 ? 0.9f : 0.4f));
+        for (int i = 0; i < n; i++)
+        {
+            FormType? force = null;
+            if (DebugTypes is { Length: > 0 }) force = (FormType)DebugTypes[i % DebugTypes.Length];
+            else if (i < geo) force = s.Style == 6 ? PickFractalType() : starters[(i + rng.Next(3)) % starters.Length];
+            Spawn(initial: true, force: force);
+        }
     }
 
     float F() => (float)rng.NextDouble();
@@ -60,7 +95,6 @@ public sealed class Director
 
     float PickKind()
     {
-        // continuous kinds: 0 spiral, 1 sinusoidal flame, 2 julia-ish, 3 tendrils, 4 cellular; fractional parts crossfade neighbours.
         float[] pool = set.Style switch
         {
             1 => new[] { 1f, 2f, 1.5f, 0.5f },
@@ -70,6 +104,36 @@ public sealed class Director
             _ => new[] { 0f, 1f, 2f, 3f, 4f, 0.5f, 1.5f, 2.5f, 3.5f }
         };
         return Math.Clamp(pool[rng.Next(pool.Length)] + R(-0.25f, 0.25f), 0f, 4f);
+    }
+
+    static bool IsRay(FormType t) => t == FormType.Mandelbulb || t == FormType.QuaternionJulia || t == FormType.Gyroid;
+    static bool IsGeometry(FormType t) => t != FormType.Flow;
+
+    FormType PickFractalType()
+    {
+        FormType[] a = { FormType.Mandelbulb, FormType.QuaternionJulia, FormType.Julia2D, FormType.Mandelbulb, FormType.QuaternionJulia };
+        return a[rng.Next(a.Length)];
+    }
+
+    FormType PickType()
+    {
+        if (DebugTypes is { Length: > 0 }) return (FormType)DebugTypes[rng.Next(DebugTypes.Length)];
+        float geom = set.Style == 5 || set.Style == 6 ? 1f : set.Geometry / 100f * (set.Style == 0 ? 0.9f : 0.3f);
+        if (F() > geom) return FormType.Flow;
+        if (set.Style == 6) return PickFractalType();
+        (FormType t, float w)[] table =
+        {
+            (FormType.Mandelbulb, 12), (FormType.QuaternionJulia, 10), (FormType.Gyroid, 8), (FormType.Julia2D, 9), (FormType.Voronoi, 8),
+            (FormType.Lissajous, 8), (FormType.Spirograph, 8), (FormType.Lorenz, 8), (FormType.Superformula2D, 6), (FormType.Superformula3D, 6), (FormType.KleinBottle, 6),
+        };
+        int rays = orgs.Count(o => IsRay(o.Type));
+        for (int attempt = 0; attempt < 6; attempt++)
+        {
+            float tot = 0; foreach (var e in table) tot += e.w;
+            float r = F() * tot;
+            foreach (var e in table) { r -= e.w; if (r <= 0) { if (IsRay(e.t) && rays >= 3) break; return e.t; } }
+        }
+        return FormType.Lissajous;
     }
 
     (float x, float y) PickPosition(bool initial)
@@ -82,7 +146,7 @@ public sealed class Director
             float c = cover[cy * GX + cx] + F() * 0.05f;
             if (c < best) { best = c; bx = ((cx + F()) / GX * 2f - 1f) * aspect; by = 1f - (cy + F()) / GY * 2f; }
         }
-        if (F() < 0.14f) // edges and corners on purpose
+        if (F() < 0.14f)
         {
             if (F() < 0.6f) bx = (F() < 0.5f ? -1f : 1f) * aspect * R(0.88f, 1.08f);
             if (F() < 0.6f) by = (F() < 0.5f ? -1f : 1f) * R(0.82f, 1.08f);
@@ -90,10 +154,11 @@ public sealed class Director
         return (bx, by);
     }
 
-    void Spawn(bool initial = false, Org? parent = null)
+    void Spawn(bool initial = false, Org? parent = null, FormType? force = null)
     {
         if (orgs.Count >= Max) return;
         var o = new Org();
+        o.Type = force ?? (parent != null ? parent.Type : PickType());
         var (px, py) = PickPosition(initial);
         o.X = px; o.Y = py;
         if (parent != null) { float a = R(0, 6.2832f); o.X = parent.X + MathF.Cos(a) * parent.Radius * 0.9f; o.Y = parent.Y + MathF.Sin(a) * parent.Radius * 0.9f; }
@@ -107,7 +172,6 @@ public sealed class Director
         o.Sym = syms[rng.Next(syms.Length)];
         o.Kind0 = parent != null ? Math.Clamp(parent.Kind0 + R(-1f, 1f), 0f, 4f) : PickKind();
         o.KindAmp = R(0.1f, 0.6f); o.KindW = R(0.01f, 0.05f); o.KindPh = R(0, 6.28f);
-        // palette: continuous hue relationships around a slowly rotating global hue (analogous / complement / triad / free)
         float[] rel = { 0f, 0.4f, -0.4f, 3.1416f, 2.0944f, -2.0944f, 1.0f, -1.0f };
         o.Hue = globalHue + rel[rng.Next(rel.Length)] + R(-0.35f, 0.35f);
         if (parent != null) o.Hue = parent.Hue + R(0.15f, 0.7f);
@@ -126,7 +190,127 @@ public sealed class Director
         o.FadeOut = R(10f, 22f);
         o.Birth = initial ? time - R(0f, o.Life * 0.45f) : time;
         o.Ph1 = R(0, 6.28f); o.Ph2 = R(0, 6.28f); o.Ph3 = R(0, 6.28f);
+        for (int i = 0; i < 8; i++) o.W[i] = R(0, 6.2832f);
+        ShapeGeometry(o);
+        var used = new bool[Max]; foreach (var q in orgs) used[q.Slot] = true;
+        int slot = 0; while (slot < Max - 1 && used[slot]) slot++;
+        o.Slot = slot;
         orgs.Add(o);
+    }
+
+    /// <summary>Type-specific size, density and base parameters.</summary>
+    void ShapeGeometry(Org o)
+    {
+        if (!IsGeometry(o.Type)) { o.CurveFrac = 0; return; }
+        switch (o.Type)
+        {
+            case FormType.Lissajous:
+                o.Radius = R(0.45f, 0.9f); o.Stretch = R(1.0f, 2.4f); o.CurveFrac = R(0.8f, 1.2f); o.Density = R(0.15f, 0.3f);
+                o.B[0] = new[] { 2f, 3f, 4f, 5f }[rng.Next(4)]; o.B[1] = new[] { 3f, 4f, 5f, 7f }[rng.Next(4)]; o.B[2] = new[] { 2f, 3f, 5f }[rng.Next(3)];
+                break;
+            case FormType.Spirograph:
+                o.Radius = R(0.45f, 0.85f); o.Stretch = R(1.0f, 1.8f); o.CurveFrac = R(0.8f, 1.2f); o.Density = R(0.15f, 0.3f);
+                o.B[0] = R(2.3f, 7.7f); o.B[1] = R(0.5f, 1.2f);
+                break;
+            case FormType.Lorenz:
+                o.Radius = R(0.5f, 0.95f); o.Stretch = R(1.0f, 1.8f); o.CurveFrac = R(1.4f, 2.0f); o.Density = R(0.15f, 0.3f);
+                o.B[0] = R(26f, 31f); o.B[1] = R(1.0f, 1.5f);
+                break;
+            case FormType.Superformula2D:
+                o.Radius = R(0.4f, 0.8f); o.Stretch = R(1.0f, 1.6f); o.CurveFrac = R(0.8f, 1.2f); o.Density = R(0.15f, 0.3f);
+                o.B[0] = rng.Next(2, 9);
+                break;
+            case FormType.Superformula3D:
+                o.Radius = R(0.45f, 0.85f); o.Stretch = 1f; o.CurveFrac = R(1.2f, 1.8f); o.Density = R(0.15f, 0.3f);
+                o.B[0] = rng.Next(2, 9); o.B[1] = rng.Next(2, 7);
+                break;
+            case FormType.KleinBottle:
+                o.Radius = R(0.45f, 0.8f); o.Stretch = 1f; o.CurveFrac = R(1.2f, 1.8f); o.Density = R(0.15f, 0.3f);
+                o.B[0] = R(0.6f, 1.2f);
+                break;
+            case FormType.Mandelbulb: case FormType.QuaternionJulia: case FormType.Gyroid:
+                o.Radius = R(0.42f, 0.78f); o.Stretch = 1f; o.CurveFrac = 0; o.Density = R(0.25f, 0.5f); o.Rot = 0;
+                break;
+            case FormType.Julia2D: case FormType.Voronoi:
+                o.Radius = R(0.45f, 0.85f); o.Stretch = 1f; o.CurveFrac = 0; o.Density = R(0.25f, 0.5f);
+                break;
+        }
+        o.Life = R(80f, 200f);
+        if (IsRay(o.Type) || o.Type == FormType.Julia2D || o.Type == FormType.Voronoi) { o.Sym = 1; }
+    }
+
+    static float S(float t, float w, float ph) => MathF.Sin(t * w + ph);
+
+    /// <summary>Continuous parameter evolution for the form's mathematics (all smooth; nothing ever jumps).</summary>
+    void Animate(Org o)
+    {
+        float t = time;
+        var G = o.G; var H = o.H;
+        Array.Clear(G); Array.Clear(H);
+        switch (o.Type)
+        {
+            case FormType.Lissajous:
+                G[0] = o.B[0] + 0.35f * S(t, 0.071f, o.W[0]);
+                G[1] = o.B[1] + 0.35f * S(t, 0.053f, o.W[1]);
+                G[2] = o.B[2] + 0.30f * S(t, 0.043f, o.W[2]);
+                G[3] = t * 0.21f + o.W[3];
+                H[0] = 1.0f;                                               // one period: a clean closed figure
+                break;
+            case FormType.Spirograph:
+                G[0] = o.B[0] + 0.6f * S(t, 0.041f, o.W[0]);          // R/r ratio
+                G[1] = Math.Clamp(o.B[1] + 0.35f * S(t, 0.057f, o.W[1]), 0.15f, 1.5f);   // pen offset
+                G[2] = S(t, 0.031f, o.W[2]);                           // hypotrochoid (+1) <-> epitrochoid (-1)
+                G[3] = 7f;
+                break;
+            case FormType.Lorenz:
+                G[0] = o.B[0] + 4f * S(t, 0.047f, o.W[0]);             // rho
+                G[1] = o.B[1];
+                break;
+            case FormType.Superformula2D:
+                G[0] = o.B[0] + 2.2f * (0.5f + 0.5f * S(t, 0.033f, o.W[0]));   // m (fractional, morphs between symmetries)
+                G[1] = 0.8f + 0.5f * S(t, 0.041f, o.W[1]);
+                G[2] = 2.2f + 1.4f * S(t, 0.037f, o.W[2]);
+                G[3] = 2.2f + 1.4f * S(t, 0.045f, o.W[3]);
+                break;
+            case FormType.Superformula3D:
+                G[0] = o.B[0] + 2.0f * (0.5f + 0.5f * S(t, 0.031f, o.W[0]));
+                G[1] = 0.9f + 0.4f * S(t, 0.039f, o.W[1]);
+                G[2] = 2.4f + 1.2f * S(t, 0.035f, o.W[2]);
+                G[3] = 2.4f + 1.2f * S(t, 0.043f, o.W[3]);
+                H[0] = o.B[1] + 1.6f * (0.5f + 0.5f * S(t, 0.029f, o.W[4]));
+                H[1] = 0.9f + 0.4f * S(t, 0.047f, o.W[5]);
+                H[2] = 2.2f + 1.2f * S(t, 0.033f, o.W[6]);
+                H[3] = 2.2f + 1.2f * S(t, 0.041f, o.W[7]);
+                break;
+            case FormType.KleinBottle:
+                G[0] = 1.25f; G[1] = 0.55f + 0.08f * S(t, 0.05f, o.W[0]); G[2] = o.B[0];
+                break;
+            case FormType.Mandelbulb:
+                G[0] = 8f + 2.4f * S(t, 0.037f, o.W[0]) + 1.2f * Mid;  // power
+                break;
+            case FormType.QuaternionJulia:
+                G[0] = -0.2f + 0.25f * S(t, 0.031f, o.W[0]); G[1] = 0.8f + 0.12f * S(t, 0.027f, o.W[1]);
+                G[2] = 0.1f + 0.25f * S(t, 0.019f, o.W[2]); G[3] = 0.10f * S(t, 0.023f, o.W[3]);
+                H[0] = 0.15f * S(t, 0.041f, o.W[4]);                       // 4D slice position
+                break;
+            case FormType.Gyroid:
+                G[0] = 3.2f + 1.5f * (0.5f + 0.5f * S(t, 0.028f, o.W[0]));
+                G[1] = 0.12f + 0.07f * S(t, 0.045f, o.W[1]) + 0.03f * Treble;
+                G[2] = 0.5f + 0.5f * S(t, 0.03f, o.W[2]);                  // gyroid <-> Schwarz-P
+                break;
+            case FormType.Julia2D:
+                {
+                    float a = t * 0.05f + o.W[0], r = 0.7885f;
+                    G[0] = r * MathF.Cos(a); G[1] = r * MathF.Sin(a);       // c travels the Julia "lotus" circle
+                    G[2] = 1.55f + 0.2f * S(t, 0.03f, o.W[1]);
+                }
+                break;
+            case FormType.Voronoi:
+                G[0] = 7f + 2.5f * S(t, 0.037f, o.W[0]);
+                G[1] = 0.8f + 0.75f * S(t, 0.06f, o.W[1]);                 // continuous subdivision level
+                G[2] = 0.05f; G[3] = 0.4f;
+                break;
+        }
     }
 
     public void Update(float dt)
@@ -136,7 +320,6 @@ public sealed class Director
         globalHue += dt * 0.0026f * (set.ColorCycle / 100f);
         GlobalFade = ColorMath.Smooth(0f, 3.5f, time);
 
-        // coverage grid: decay, then add each origin's footprint
         float decay = MathF.Exp(-dt / 22f);
         for (int i = 0; i < cover.Length; i++) cover[i] *= decay;
 
@@ -148,7 +331,6 @@ public sealed class Director
             o.Weight = w;
             if (age > end) { orgs.RemoveAt(i); continue; }
 
-            // drift with soft pull back if far outside the canvas
             o.X += o.VX * dt; o.Y += o.VY * dt;
             float ox = MathF.Abs(o.X) - aspect * 1.15f, oy = MathF.Abs(o.Y) - 1.15f;
             if (ox > 0) o.VX -= MathF.Sign(o.X) * ox * 0.02f * dt;
@@ -156,8 +338,9 @@ public sealed class Director
             o.Rot += o.RotVel * dt;
             o.Hue += o.HueRate * dt * (set.ColorCycle / 100f);
             o.KindNow = Math.Clamp(o.Kind0 + o.KindAmp * MathF.Sin(time * o.KindW + o.KindPh), 0f, 4f);
-            o.RadiusNow = o.Radius * (1f + 0.16f * MathF.Sin(time * 0.071f + o.Ph1) + 0.07f * MathF.Sin(time * 0.173f + o.Ph2));
+            o.RadiusNow = o.Radius * (1f + 0.16f * MathF.Sin(time * 0.071f + o.Ph1) + 0.07f * MathF.Sin(time * 0.173f + o.Ph2)) * (1f + 0.06f * Bass);
             o.TwistNow = o.Twist * (0.75f + 0.25f * MathF.Sin(time * 0.05f + o.Ph3));
+            Animate(o);
 
             if (o.MergeInto != null)
             {
@@ -167,7 +350,6 @@ public sealed class Director
                 t.Hue -= dh * 0.01f * dt;
             }
 
-            // footprint
             if (w > 0.02f)
             {
                 float rx = o.RadiusNow * MathF.Max(o.Stretch, 1f) * 1.2f, ry = o.RadiusNow * 1.2f;
@@ -177,7 +359,6 @@ public sealed class Director
             }
         }
 
-        // population control: smooth "mood" between sparse and dense scenes
         float target = TargetCount(time);
         int live = 0; foreach (var o in orgs) if (time - o.Birth < o.Life - o.FadeOut) live++;
         if (time >= nextSpawn && live < target) { Spawn(); nextSpawn = time + R(1.5f, 4.5f); }
@@ -188,7 +369,6 @@ public sealed class Director
             if (worst != null) worst.Life = (time - worst.Birth) + worst.FadeOut + 0.5f;
         }
 
-        // occasional events: merge two forms, or split one into a child
         if (time >= nextEvent && orgs.Count >= 3)
         {
             nextEvent = time + R(22f, 55f);
@@ -211,22 +391,27 @@ public sealed class Director
 
     void Pack()
     {
-        int n = 0;
+        Array.Clear(Gpu);
+        int n = 0, geo = 0, top = 0; float fw = 0, cw = 0;
         foreach (var o in orgs)
         {
-            if (n >= Max) break;
             if (o.Weight < 0.002f) continue;
-            int i = n * FloatsPerOrigin;
+            int i = o.Slot * FloatsPerOrigin;
+            top = Math.Max(top, o.Slot + 1);
             Gpu[i + 0] = o.X; Gpu[i + 1] = o.Y; Gpu[i + 2] = o.RadiusNow; Gpu[i + 3] = o.Weight;
             Gpu[i + 4] = o.Rot; Gpu[i + 5] = o.Sym; Gpu[i + 6] = o.Stretch; Gpu[i + 7] = o.KindNow;
             float chroma = o.Chroma * set.ColorRichness / 100f;
             Gpu[i + 8] = o.Hue; Gpu[i + 9] = chroma; Gpu[i + 10] = o.Light; Gpu[i + 11] = o.Spread;
-            Gpu[i + 12] = o.Radial; Gpu[i + 13] = o.TwistNow; Gpu[i + 14] = o.Density; Gpu[i + 15] = 0;
+            Gpu[i + 12] = o.Radial; Gpu[i + 13] = o.TwistNow; Gpu[i + 14] = o.Density; Gpu[i + 15] = (float)o.Type;
             Gpu[i + 16] = o.GradX; Gpu[i + 17] = o.GradY; Gpu[i + 18] = o.Freq; Gpu[i + 19] = o.Phase;
             var (r, g, b) = ColorMath.OklchToLinearSrgb(o.Light * 0.9f, chroma * 0.8f, o.Hue);
-            Gpu[i + 20] = r * o.Weight; Gpu[i + 21] = g * o.Weight; Gpu[i + 22] = b * o.Weight; Gpu[i + 23] = 0;
+            Gpu[i + 20] = r * o.Weight; Gpu[i + 21] = g * o.Weight; Gpu[i + 22] = b * o.Weight; Gpu[i + 23] = o.CurveFrac;
+            for (int k = 0; k < 4; k++) { Gpu[i + 24 + k] = o.G[k]; Gpu[i + 28 + k] = o.H[k]; }
+            if (IsGeometry(o.Type)) geo++;
+            fw += o.Weight * o.Density;
+            if (o.Type >= FormType.Lissajous && o.Type <= FormType.KleinBottle) cw += o.Weight * o.CurveFrac;
             n++;
         }
-        Count = n;
+        Count = top; GeometryCount = geo; FlowWeightSum = fw; CurveWeightSum = cw;   // Count = highest used slot + 1 (shader loop bound)
     }
 }

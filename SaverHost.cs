@@ -181,19 +181,19 @@ static class SaverHost
         var dir = new Director(s, (float)w / h, s.Seed != 0 ? s.Seed : 20261101);
         using var r = Renderer.CreateWithFallback(IntPtr.Zero, w, h, s, dir, true, 240f, "bench", false);
         var wall = Stopwatch.StartNew();
-        double gpuSum = 0, simSum = 0, fieldSum = 0, partSum = 0, postSum = 0; int n = 0;
+        double gpuSum = 0, simSum = 0, fieldSum = 0, partSum = 0, postSum = 0, geoSum = 0; int n = 0;
         for (int i = 0; i < frames; i++)
         {
             if (i == frames - 1) r.RequestCapture();
             r.RenderFrame(1f / 60f);
-            if (i >= frames - 120) { gpuSum += r.Stats.GpuMs; simSum += r.Stats.GpuSimMs; fieldSum += r.Stats.GpuFeedbackMs; partSum += r.Stats.GpuParticlesMs; postSum += r.Stats.GpuPostMs; n++; }
+            if (i >= frames - 120) { gpuSum += r.Stats.GpuMs; simSum += r.Stats.GpuSimMs; fieldSum += r.Stats.GpuFeedbackMs; partSum += r.Stats.GpuParticlesMs; geoSum += r.Stats.GpuGeoMs; postSum += r.Stats.GpuPostMs; n++; }
         }
         wall.Stop();
         var st = r.Stats;
         string report =
             $"[{DateTime.Now:s}] bench {w}x{h} frames={frames} quality={s.Quality} density={s.Density}\n" +
-            $"  GPU: {st.Gpu}\n  render {st.RenderW}x{st.RenderH} (scale {st.Scale:F2}) particles {st.Particles:N0} forms {st.Forms}\n" +
-            $"  GPU ms/frame (last {n}): total {gpuSum / n:F3}  sim {simSum / n:F3}  feedback {fieldSum / n:F3}  particles {partSum / n:F3}  post {postSum / n:F3}  => {1000.0 / (gpuSum / n):F0} fps GPU-bound\n" +
+            $"  GPU: {st.Gpu}\n  render {st.RenderW}x{st.RenderH} (scale {st.Scale:F2}) particles {st.Particles:N0} forms {st.Forms} (geometry {st.GeoForms})\n" +
+            $"  GPU ms/frame (last {n}): total {gpuSum / n:F3}  sim {simSum / n:F3}  feedback {fieldSum / n:F3}  particles {partSum / n:F3}  geometry {geoSum / n:F3}  post {postSum / n:F3}  => {1000.0 / (gpuSum / n):F0} fps GPU-bound\n" +
             $"  wall: {wall.Elapsed.TotalSeconds:F2}s for {frames} frames = {frames / wall.Elapsed.TotalSeconds:F1} fps incl. CPU\n" +
             $"  VRAM: {st.VramUsed / 1048576.0:F0} MB used of {st.VramBudget / 1048576.0:F0} MB budget\n";
         File.AppendAllText(logPath, report);

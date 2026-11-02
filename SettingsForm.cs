@@ -10,7 +10,7 @@ sealed class SettingsForm : Form
     readonly Dictionary<string, Action<Settings>> appliers = new();
     readonly TableLayoutPanel grid = new() { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3, Padding = new Padding(12, 12, 12, 4) };
 
-    static readonly string[] Styles = { "Mixed (everything)", "Flame / filaments", "Tendrils / branching", "Cellular / membranes", "Spirals / vortices" };
+    static readonly string[] Styles = { "Mixed (everything)", "Flame / filaments", "Tendrils / branching", "Cellular / membranes", "Spirals / vortices", "Mathematical geometry only", "Fractals only (Mandelbulb, Julia)" };
     static readonly string[] Qualities = { "Low power (fewer particles, lower resolution, 60 fps cap)", "Balanced", "Maximum quality (native resolution, most detail)" };
     static readonly int[] Caps = { 0, 30, 60, 90, 120, 144, 165, 180, 240 };
 
@@ -30,6 +30,7 @@ sealed class SettingsForm : Form
 
         Header("Look");
         Combo("Style", Styles, () => s.Style, v => s.Style = v);
+        Slider("Geometry amount", 0, 100, () => s.Geometry, v => s.Geometry = v, "%");
         Slider("Density", 20, 200, () => s.Density, v => s.Density = v, "%");
         Slider("Motion speed", 10, 250, () => s.Speed, v => s.Speed = v, "%");
         Slider("Brightness", 20, 120, () => s.Brightness, v => s.Brightness = v, "");

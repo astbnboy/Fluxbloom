@@ -21,6 +21,7 @@ static class Program
             }
 
             var settings = Settings.Load();
+            { var ty = Environment.GetEnvironmentVariable("FLX_TYPES"); if (!string.IsNullOrWhiteSpace(ty)) Director.DebugTypes = ty.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray(); }
             { var e = Environment.GetEnvironmentVariable("FLX_INJECT"); if (float.TryParse(e, out var v)) Renderer.InjectBase = v; e = Environment.GetEnvironmentVariable("FLX_HAZE"); if (float.TryParse(e, out v)) Renderer.HazeBase = v; e = Environment.GetEnvironmentVariable("FLX_BLOOM"); if (float.TryParse(e, out v)) Renderer.BloomBase = v; }
             switch (mode)
             {

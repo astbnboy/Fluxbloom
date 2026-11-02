@@ -25,12 +25,15 @@ unsafe struct FrameCB
     public float Advect, SoftFrac, Pad0, Pad1;
     public float SeedX, SeedY, SeedZ, SeedW;
     public float FlowTexW, FlowTexH, HudW, HudH;
+    public float AudioBass, AudioMid, AudioTreble, AudioBeat;
+    public float GeoSteps, GeoIter, GeoGain, GeoPad;
     public fixed float Origins[Director.Max * Director.FloatsPerOrigin];
 }
 
 public struct RenderStats
 {
-    public double Fps, CpuMs, GpuMs, GpuFieldMs, GpuPostMs, GpuSimMs, GpuFeedbackMs, GpuParticlesMs;
+    public double Fps, CpuMs, GpuMs, GpuFieldMs, GpuPostMs, GpuSimMs, GpuFeedbackMs, GpuParticlesMs, GpuGeoMs;
+    public int GeoForms;
     public int RenderW, RenderH, OutW, OutH, Particles, Forms;
     public float Scale, ParticleFraction;
     public long VramUsed, VramBudget;
@@ -42,12 +45,12 @@ public struct RenderStats
 public sealed unsafe class Renderer : IDisposable
 {
     const int FrameCount = 3;
-    const int TableStride = 8;
+    const int TableStride = 10;
     const Format SceneFmt = Format.R16G16B16A16_Float;
     const Format FinalFmt = Format.R10G10B10A2_UNorm;
     const int ParticleBytes = 64;
     const int Ts = 6; // timestamps per frame
-    const int HudW = 512, HudH = 176;
+    const int HudW = 512, HudH = 192;
     const uint AllSub = 0xFFFFFFFF;
 
     sealed class Tex
@@ -81,7 +84,7 @@ public sealed unsafe class Renderer : IDisposable
     CpuDescriptorHandle rtvBase;
     int rtvNext;
     ID3D12RootSignature rootSig = null!;
-    ID3D12PipelineState psoField = null!, psoParticles = null!, psoDown = null!, psoUp = null!, psoComposite = null!, psoUpdate = null!, psoFlow = null!;
+    ID3D12PipelineState psoField = null!, psoParticles = null!, psoDown = null!, psoUp = null!, psoComposite = null!, psoUpdate = null!, psoFlow = null!, psoGeo = null!;
 
     ID3D12Resource[] cbUpload = new ID3D12Resource[FrameCount];
     byte*[] cbPtr = new byte*[FrameCount];
@@ -90,6 +93,7 @@ public sealed unsafe class Renderer : IDisposable
     Tex flow = null!;
     Tex[] scene = new Tex[2];
     Tex[] bloom = new Tex[4];
+    Tex geo = null!, curve = null!;
     ID3D12Resource? hudTex, hudUpload;
     byte* hudPtr;
     ResourceStates hudState = ResourceStates.PixelShaderResource;
@@ -107,14 +111,15 @@ public sealed unsafe class Renderer : IDisposable
     ID3D12Resource? captureBuf;
 
     // table indices (each table = TableStride descriptors)
-    const int T_UPDATE = 0, T_FLOW = 1, T_FIELD = 2 /*2*/, T_DOWN0 = 4 /*2*/, T_DOWN = 6 /*3: src L0,L1,L2*/, T_UP = 9 /*3: src L3,L2,L1*/, T_COMP = 12 /*2*/, TableCount = 14;
+    const int T_UPDATE = 0, T_FLOW = 1, T_FIELD = 2 /*2*/, T_DOWN0 = 4 /*2*/, T_DOWN = 6 /*3: src L0,L1,L2*/, T_UP = 9 /*3: src L3,L2,L1*/, T_COMP = 12 /*2*/, T_GEO = 14, TableCount = 15;
 
     public int OutW { get; private set; }
     public int OutH { get; private set; }
     int rw, rh;
     float scale = 1f, minScale = 0.5f, maxScale = 1f;
     float particleFrac = 1f;
-    int capacity, activeBase;
+    int capacity, activeBase, nbMax, curveStart, curNa, curNb;
+    float perWeightB;
     int qEff;
     int cur;
     uint frameIndex;
@@ -130,7 +135,7 @@ public sealed unsafe class Renderer : IDisposable
     double lastFrameT;
     double fpsAcc; int fpsCount; double fpsShown;
     double cpuMsAcc;
-    double gpuTotal, gpuSim, gpuField, gpuPost, gpuFieldOnly, gpuParts;
+    double gpuTotal, gpuSim, gpuField, gpuPost, gpuFieldOnly, gpuParts, gpuGeo;
     double govTimer, lastChangeT;
     int govFrames; double govGpuSum;
     double nextFrameDeadline;
@@ -297,8 +302,8 @@ public sealed unsafe class Renderer : IDisposable
     {
         var ranges = new[]
         {
-            new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 5, 0, 0, 0, DescriptorRangeFlags.DescriptorsVolatile | DescriptorRangeFlags.DataVolatile),
-            new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 2, 0, 0, 5, DescriptorRangeFlags.DescriptorsVolatile | DescriptorRangeFlags.DataVolatile),
+            new DescriptorRange1(DescriptorRangeType.ShaderResourceView, 7, 0, 0, 0, DescriptorRangeFlags.DescriptorsVolatile | DescriptorRangeFlags.DataVolatile),
+            new DescriptorRange1(DescriptorRangeType.UnorderedAccessView, 2, 0, 0, 7, DescriptorRangeFlags.DescriptorsVolatile | DescriptorRangeFlags.DataVolatile),
         };
         var parms = new[]
         {
@@ -327,6 +332,7 @@ public sealed unsafe class Renderer : IDisposable
         psoDown = device.CreateGraphicsPipelineState(Gfx(vsFull, Compile("PS_Down", "ps_5_1"), BlendDescription.Opaque, SceneFmt));
         psoUp = device.CreateGraphicsPipelineState(Gfx(vsFull, Compile("PS_Up", "ps_5_1"), add, SceneFmt));
         psoComposite = device.CreateGraphicsPipelineState(Gfx(vsFull, Compile("PS_Composite", "ps_5_1"), BlendDescription.Opaque, FinalFmt));
+        psoGeo = device.CreateGraphicsPipelineState(Gfx(vsFull, Compile("PS_Geo", "ps_5_1"), BlendDescription.Opaque, SceneFmt));
         psoUpdate = device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = rootSig, ComputeShader = Compile("CS_Update", "cs_5_1") });
         psoFlow = device.CreateComputePipelineState(new ComputePipelineStateDescription { RootSignature = rootSig, ComputeShader = Compile("CS_Flow", "cs_5_1") });
     }
@@ -355,7 +361,11 @@ public sealed unsafe class Renderer : IDisposable
         // Particle buffer sized by quality
         int[] baseP = { 700_000, 1_600_000, 3_200_000 };
         activeBase = baseP[qEff];
-        capacity = (int)(activeBase * 1.5f);
+        int[] nbCap = { 120_000, 250_000, 400_000 };
+        float[] pwb = { 40_000f, 70_000f, 85_000f };
+        nbMax = nbCap[qEff]; perWeightB = pwb[qEff];
+        capacity = (int)(activeBase * 1.5f) + nbMax;      // flow pool [0, curveStart) + dedicated curve pool [curveStart, capacity)
+        curveStart = capacity - nbMax;
         particles = CommittedBuffer(HeapType.Default, (ulong)capacity * ParticleBytes, ResourceFlags.AllowUnorderedAccess, ResourceStates.UnorderedAccess);
         particleState = ResourceStates.UnorderedAccess;
     }
@@ -406,6 +416,11 @@ public sealed unsafe class Renderer : IDisposable
         rh = Math.Max(64, ((int)(OutH * scale)) & ~1);
         for (int i = 0; i < 2; i++) { scene[i]?.Res.Dispose(); scene[i] = MakeTarget(SceneFmt, rw, rh, true); }
         for (int i = 0; i < 4; i++) { bloom[i]?.Res.Dispose(); bloom[i] = MakeTarget(SceneFmt, Math.Max(2, rw >> (i + 1)), Math.Max(2, rh >> (i + 1)), true); }
+        float[] gsc = { 0.4f, 0.5f, 0.65f };
+        geo?.Res.Dispose(); curve?.Res.Dispose();
+        geo = MakeTarget(SceneFmt, Math.Max(64, (int)(rw * gsc[qEff])) & ~1, Math.Max(64, (int)(rh * gsc[qEff])) & ~1, true);
+        curve?.Res.Dispose();
+        curve = MakeTarget(SceneFmt, rw, rh, true);
         int fw = (rw + 7) / 8, fh = (rh + 7) / 8;
         flow?.Res.Dispose();
         flow = new Tex { W = fw, H = fh, State = ResourceStates.PixelShaderResource | ResourceStates.NonPixelShaderResource };
@@ -451,9 +466,11 @@ public sealed unsafe class Renderer : IDisposable
                 Format = Format.Unknown, ViewDimension = UnorderedAccessViewDimension.Buffer,
                 Buffer = new BufferUnorderedAccessView { FirstElement = 0, NumElements = (uint)capacity, StructureByteStride = ParticleBytes, Flags = BufferUnorderedAccessViewFlags.None },
             };
-            device.CreateUnorderedAccessView(particles, null, u0, SrvCpu(t, 5));
+            SrvTex(t, 5, geo.Res, SceneFmt);
+            SrvTex(t, 6, curve.Res, SceneFmt);
+            device.CreateUnorderedAccessView(particles, null, u0, SrvCpu(t, 7));
             var u1 = new UnorderedAccessViewDescription { Format = Format.R16G16_Float, ViewDimension = UnorderedAccessViewDimension.Texture2D, Texture2D = new Texture2DUnorderedAccessView { MipSlice = 0, PlaneSlice = 0 } };
-            device.CreateUnorderedAccessView(flow.Res, null, u1, SrvCpu(t, 6));
+            device.CreateUnorderedAccessView(flow.Res, null, u1, SrvCpu(t, 8));
         }
         for (int t = 0; t < TableCount; t++) Common(t);
         for (int c = 0; c < 2; c++)
@@ -534,6 +551,8 @@ public sealed unsafe class Renderer : IDisposable
         WaitForFence(frameFence[fi]);
         ReadTimestamps(fi);
 
+        AudioFeatures.Tick(dir.Time, dt);
+        dir.Bass = AudioFeatures.Bass; dir.Mid = AudioFeatures.Mid; dir.Treble = AudioFeatures.Treble; dir.Beat = AudioFeatures.Beat;
         dir.Update(dt);
         UpdateHud(dt);
 
@@ -583,9 +602,29 @@ public sealed unsafe class Renderer : IDisposable
         cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 2));
         cmd.SetPipelineState(psoParticles);
         cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
-        cmd.DrawInstanced(4, cb.ParticleCount, 0, 0);
+        cmd.DrawInstanced(4, (uint)curNa, 0, 0);
         Tr(dst, ResourceStates.PixelShaderResource);
+
+        // crisp curve layer: only curve-locked particles, cleared every frame (no feedback, so line work stays sharp)
+        Tr(curve, ResourceStates.RenderTarget);
+        cmd.ClearRenderTargetView(curve.Rtv, new Vortice.Mathematics.Color4(0f, 0f, 0f, 0f));
+        cmd.OMSetRenderTargets(curve.Rtv, null);
+        cmd.RSSetViewport(new Viewport(0, 0, curve.W, curve.H, 0f, 1f));
+        cmd.RSSetScissorRect(curve.W, curve.H);
+        PassConst(0, 0, 0, 1);
+        cmd.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+        if (curNb > 0) cmd.DrawInstanced(4, (uint)curNb, 0, 0);
+        Tr(curve, ResourceStates.PixelShaderResource);
         cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 3));
+
+        // ---- geometry layer: raymarched Mandelbulb / quaternion Julia / gyroid, Julia sets, Voronoi (reduced resolution)
+        Tr(geo, ResourceStates.RenderTarget);
+        cmd.SetPipelineState(psoGeo);
+        SetRoot(SrvGpu(T_GEO), cbva, false);
+        PassConst(0, 0, 0, 0);
+        DrawFull(geo);
+        Tr(geo, ResourceStates.PixelShaderResource);
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 4));
 
         // ---- bloom: down chain then additive up chain
         for (int i = 0; i < 4; i++)
@@ -595,7 +634,7 @@ public sealed unsafe class Renderer : IDisposable
             cmd.SetPipelineState(psoDown);
             SetRoot(SrvGpu(i == 0 ? T_DOWN0 + cur : T_DOWN + (i - 1)), cbva, false);
             var srcTex = i == 0 ? dst : bloom[i - 1];
-            PassConst(1f / srcTex.W, 1f / srcTex.H, 1f, 0f);
+            PassConst(1f / srcTex.W, 1f / srcTex.H, 1f, i == 0 ? 1f : 0f);
             DrawFull(b);
             Tr(b, ResourceStates.PixelShaderResource);
         }
@@ -642,8 +681,8 @@ public sealed unsafe class Renderer : IDisposable
         }
         else cmd.ResourceBarrierTransition(finalRes, ResourceStates.RenderTarget, ResourceStates.Present, AllSub, ResourceBarrierFlags.None);
 
-        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 4));
-        cmd.ResolveQueryData(queryHeap, QueryType.Timestamp, (uint)(fi * Ts), 5, queryReadback, (ulong)(fi * Ts * 8));
+        cmd.EndQuery(queryHeap, QueryType.Timestamp, (uint)(fi * Ts + 5));
+        cmd.ResolveQueryData(queryHeap, QueryType.Timestamp, (uint)(fi * Ts), 6, queryReadback, (ulong)(fi * Ts * 8));
         cmd.Close();
         queue.ExecuteCommandLists(new ID3D12CommandList[] { cmd });
 
@@ -700,14 +739,21 @@ public sealed unsafe class Renderer : IDisposable
     FrameCB BuildConstants(float dt)
     {
         var cb = new FrameCB();
-        int active = (int)(capacity * Math.Clamp(set.Density / 150f, 0.15f, 1f) * particleFrac);
-        active = Math.Clamp(active, 20_000, capacity);
+        // Pool sizes follow the scene: flow particles scale with the total flow weight, curve particles with the curve forms present.
+        float perWeight = activeBase / 8f;
+        float want = perWeight * particleFrac * Math.Max(dir.FlowWeightSum, 0.01f);
+        int na = Math.Clamp((int)want, 30_000, curveStart);
+        float eff = Math.Min(1f, na / Math.Max(want, 1f));
+        int nb = Math.Clamp((int)(perWeightB * particleFrac * dir.CurveWeightSum), 0, nbMax);
+        curNa = na; curNb = nb;
         float fade = dir.GlobalFade;
+        float resF = (rw * (float)rh) / (5120f * 1440f);
         cb.ResX = rw; cb.ResY = rh; cb.InvResX = 1f / rw; cb.InvResY = 1f / rh;
         cb.Aspect = (float)OutW / OutH; cb.Time = dir.Time; cb.Dt = dt; cb.Frame = frameIndex;
-        cb.Exposure = 1f; cb.Bloom = BloomBase; cb.Decay = 1.7f;
-        cb.Inject = InjectBase * fade * (1_600_000f / active) * (rw * (float)rh) / (5120f * 1440f);
-        cb.ParticleCount = (uint)active; cb.OriginCount = (uint)dir.Count;
+        cb.Exposure = 1f + 0.10f * dir.Beat; cb.Bloom = BloomBase; cb.Decay = 1.7f;
+        cb.Inject = InjectBase * fade * (1_600_000f / (perWeight * 8f * particleFrac * eff)) * resF;
+        cb.ParticleCount = (uint)(na + nb); cb.OriginCount = (uint)dir.Count;
+        cb.SoftFrac = na; cb.Pad0 = curveStart; cb.Pad1 = nb;
         cb.GamutMode = hdrOut ? 1u : 0u; cb.OutMode = hdrOut ? 1u : 0u;
         cb.PaperWhite = 200f; cb.Hud = set.ShowDiagnostics ? 1f : 0f;
         cb.FlowSpeed = set.Speed / 100f * 1.6f; cb.Dither = 1f;
@@ -716,8 +762,12 @@ public sealed unsafe class Renderer : IDisposable
         cb.Advect = 0.9f;
         cb.SeedX = BitConverter.Int32BitsToSingle((int)(frameIndex * 2654435761u)); cb.SeedY = 0; cb.SeedZ = 0; cb.SeedW = 0;
         cb.FlowTexW = flow.W; cb.FlowTexH = flow.H; cb.HudW = HudW; cb.HudH = HudH;
+        cb.AudioBass = dir.Bass; cb.AudioMid = dir.Mid; cb.AudioTreble = dir.Treble; cb.AudioBeat = dir.Beat;
+        cb.GeoSteps = (qEff == 0 ? 0.7f : qEff == 1 ? 0.9f : 1f) * (particleFrac < 0.5f ? 0.85f : 1f);
+        cb.GeoIter = qEff == 2 ? 1f : 0f; cb.GeoGain = 0.95f;
+        cb.GeoPad = 0.075f * fade * (85_000f / (perWeightB * particleFrac)) * resF;   // curve-particle emission (gGeo.w)
         for (int i = 0; i < Director.Max * Director.FloatsPerOrigin; i++) cb.Origins[i] = dir.Gpu[i];
-        activeNow = active;
+        activeNow = na + nb;
         return cb;
     }
     int activeNow;
@@ -743,14 +793,15 @@ public sealed unsafe class Renderer : IDisposable
         if (frameIndex < FrameCount) return;
         ulong* q = queryPtr + fi * Ts;
         double toMs = 1000.0 / tsFreq;
-        if (q[4] > q[0])
+        if (q[5] > q[0])
         {
-            gpuTotal = (q[4] - q[0]) * toMs;
+            gpuTotal = (q[5] - q[0]) * toMs;
+            gpuGeo = (q[4] - q[3]) * toMs;
             gpuSim = (q[1] - q[0]) * toMs;
             gpuFieldOnly = (q[2] - q[1]) * toMs;
             gpuParts = (q[3] - q[2]) * toMs;
             gpuField = gpuFieldOnly + gpuParts;
-            gpuPost = (q[4] - q[3]) * toMs;
+            gpuPost = (q[5] - q[4]) * toMs;
         }
     }
 
@@ -765,9 +816,9 @@ public sealed unsafe class Renderer : IDisposable
             Stats.Fps = fpsShown; Stats.CpuMs = cpuMsAcc / fpsCount;
             fpsAcc = 0; fpsCount = 0; cpuMsAcc = 0;
         }
-        Stats.GpuFeedbackMs = gpuFieldOnly; Stats.GpuParticlesMs = gpuParts; Stats.GpuMs = gpuTotal; Stats.GpuSimMs = gpuSim; Stats.GpuFieldMs = gpuField; Stats.GpuPostMs = gpuPost;
+        Stats.GpuGeoMs = gpuGeo; Stats.GeoForms = dir.GeometryCount; Stats.GpuFeedbackMs = gpuFieldOnly; Stats.GpuParticlesMs = gpuParts; Stats.GpuMs = gpuTotal; Stats.GpuSimMs = gpuSim; Stats.GpuFieldMs = gpuField; Stats.GpuPostMs = gpuPost;
         Stats.RenderW = rw; Stats.RenderH = rh; Stats.OutW = OutW; Stats.OutH = OutH; Stats.Scale = scale;
-        Stats.Particles = activeNow; Stats.ParticleFraction = particleFrac; Stats.Forms = dir.Count; Stats.Gpu = gpuName;
+        Stats.Particles = activeNow; Stats.ParticleFraction = particleFrac; Stats.Forms = dir.ActiveForms; Stats.Gpu = gpuName;
         Stats.Mode = hdrOut ? "HDR10 / Rec.2020, 10-bit" : "SDR sRGB, 10-bit dithered";
         if (adapter3 != null && (frameIndex & 31) == 0)
         {
@@ -827,7 +878,7 @@ public sealed unsafe class Renderer : IDisposable
                 $"{s.Fps,6:F1} fps  cap {s.Cap}  ({s.Hz:F0} Hz)  cpu {s.CpuMs:F2} ms\n" +
                 $"gpu {s.GpuMs:F2} ms  sim {s.GpuSimMs:F2}  feedback {s.GpuFeedbackMs:F2}  parts {s.GpuParticlesMs:F2}  post {s.GpuPostMs:F2}\n" +
                 $"render {s.RenderW}x{s.RenderH}  out {s.OutW}x{s.OutH}  scale {s.Scale:F2}\n" +
-                $"particles {s.Particles:N0}  ({s.ParticleFraction:P0})  forms {s.Forms}\n" +
+                $"particles {s.Particles:N0}  ({s.ParticleFraction:P0})  forms {s.Forms} (geometry {s.GeoForms})  geo pass {s.GpuGeoMs:F2} ms\n" +
                 $"vram {s.VramUsed / 1048576.0:F0} / {s.VramBudget / 1048576.0:F0} MB\n" +
                 $"{s.Mode}";
             g.DrawString(txt, f, br, 6, 4);
@@ -846,10 +897,11 @@ public sealed unsafe class Renderer : IDisposable
         queryReadback?.Dispose(); queryHeap?.Dispose();
         foreach (var t in scene) t?.Res.Dispose();
         foreach (var t in bloom) t?.Res.Dispose();
+        geo?.Res.Dispose(); curve?.Res.Dispose();
         flow?.Res.Dispose();
         foreach (var b in backBuffers) b?.Dispose();
         swap?.Dispose(); cmd?.Dispose(); foreach (var a in allocs) a?.Dispose(); fence?.Dispose(); queue?.Dispose();
-        rootSig?.Dispose(); psoField?.Dispose(); psoParticles?.Dispose(); psoDown?.Dispose(); psoUp?.Dispose(); psoComposite?.Dispose(); psoUpdate?.Dispose(); psoFlow?.Dispose();
+        rootSig?.Dispose(); psoField?.Dispose(); psoParticles?.Dispose(); psoDown?.Dispose(); psoUp?.Dispose(); psoComposite?.Dispose(); psoUpdate?.Dispose(); psoFlow?.Dispose(); psoGeo?.Dispose();
         rtvHeap?.Dispose(); srvHeap?.Dispose(); device?.Dispose(); adapter3?.Dispose(); adapter?.Dispose(); factory?.Dispose();
     }
 }
